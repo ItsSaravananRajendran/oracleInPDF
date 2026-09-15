@@ -48,6 +48,21 @@ def set_pdf_title(hash_: str, title: str) -> int:
         return cur.rowcount
 
 
+def delete_pdf(hash_: str) -> None:
+    """Remove a book from the library: every session/message tied to it,
+    its cached page text, and the pdf row itself. Does not touch the file
+    on disk (local files are opened in place, not owned by the app)."""
+    with conn() as c:
+        session_ids = [r["id"] for r in c.execute(
+            "SELECT id FROM session WHERE pdf_hash=?", (hash_,)
+        ).fetchall()]
+        for sid in session_ids:
+            c.execute("DELETE FROM message WHERE session_id=?", (sid,))
+        c.execute("DELETE FROM session WHERE pdf_hash=?", (hash_,))
+        c.execute("DELETE FROM pdf_text_cache WHERE pdf_hash=?", (hash_,))
+        c.execute("DELETE FROM pdf WHERE hash=?", (hash_,))
+
+
 def get_page_text(pdf_hash: str, page: int) -> tuple:
     with conn() as c:
         row = c.execute(
@@ -204,7 +219,7 @@ def delete_anchor_for_message(message_id: str) -> int:
 def list_pdfs():
     with conn() as c:
         return c.execute(
-            """SELECT p.hash, p.source, p.title, p.page_count, p.bytes, p.created_at,
+            """SELECT p.hash, p.source, p.path, p.title, p.page_count, p.bytes, p.created_at,
                       (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash) AS last_session_at,
                       (SELECT COUNT(*) FROM session s WHERE s.pdf_hash=p.hash) AS session_count,
                       (SELECT COUNT(*) FROM message m JOIN session s ON m.session_id=s.id

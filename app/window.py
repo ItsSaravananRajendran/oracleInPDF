@@ -1,15 +1,18 @@
-"""Main window: toolbar + reader/chat split pane."""
+"""Main window: toolbar + library/reader stack."""
 from __future__ import annotations
+
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("EvinceView", "3.0")
-from gi.repository import EvinceView, Gtk  # noqa: E402
+from gi.repository import EvinceView, GLib, Gtk  # noqa: E402
 
 from app import pdf_ops, settings
 from app.chat.panel import ChatPanel
 from app.db import repo
+from app.library_view import LibraryView
 from app.reader.view import ReaderView
 
 ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -23,19 +26,30 @@ class MainWindow(Gtk.ApplicationWindow):
         self.reader_view = ReaderView()
         self.chat_panel = ChatPanel(self.reader_view)
         self.reader_view.on_selection_changed = self.chat_panel.on_selection_changed
+        self.library_view = LibraryView(
+            on_open=self._open_from_library, on_add=self._on_open_clicked, on_remove=self._on_remove_from_library,
+        )
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(root)
         root.pack_start(self._build_toolbar(), False, False, 0)
 
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.pack1(self.reader_view, True, False)
-        paned.pack2(self.chat_panel, False, False)
-        paned.set_position(820)
-        root.pack_start(paned, True, True, 0)
+        reader_pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        reader_pane.pack1(self.reader_view, True, False)
+        reader_pane.pack2(self.chat_panel, False, False)
+        reader_pane.set_position(820)
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(self.library_view, "library")
+        self.stack.add_named(reader_pane, "reader")
+        root.pack_start(self.stack, True, True, 0)
 
         self.current_hash: str | None = None
         self.show_all()
+        self.stack.set_visible_child_name("library")
+        # show_all() force-shows every child, including the empty-state
+        # label refresh() had hidden — reapply visibility after it.
+        self.library_view.refresh()
 
     def _build_toolbar(self) -> Gtk.Box:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -67,7 +81,11 @@ class MainWindow(Gtk.ApplicationWindow):
         bar.pack_start(self.title_label, True, True, 0)
         return bar
 
-    # ---- opening --------------------------------------------------------
+    # ---- library / opening ------------------------------------------------
+
+    def _on_library_clicked(self, _btn) -> None:
+        self.library_view.refresh()
+        self.stack.set_visible_child_name("library")
 
     def _on_open_clicked(self, _btn) -> None:
         dialog = Gtk.FileChooserDialog(
@@ -85,39 +103,21 @@ class MainWindow(Gtk.ApplicationWindow):
             self.open_path(dialog.get_filename())
         dialog.destroy()
 
-    def _on_library_clicked(self, _btn) -> None:
-        pdfs = repo.list_pdfs()
-        dialog = Gtk.Dialog(title="Library", parent=self, flags=0)
-        dialog.add_buttons(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
-        box = dialog.get_content_area()
-        listbox = Gtk.ListBox()
-        for p in pdfs:
-            row = Gtk.ListBoxRow()
-            label = Gtk.Label(label=f"{p['title'] or p['source']}  ({p['page_count'] or '?'} pages)", xalign=0)
-            label.set_margin_start(8)
-            label.set_margin_end(8)
-            label.set_margin_top(4)
-            label.set_margin_bottom(4)
-            row.add(label)
-            row.pdf_hash = p["hash"]
-            row.pdf_path = p["path"]
-            listbox.add(row)
-        listbox.connect("row-activated", self._on_library_row_activated, dialog)
-        box.pack_start(listbox, True, True, 0)
-        dialog.set_default_size(500, 400)
-        dialog.show_all()
-        dialog.run()
-        dialog.destroy()
+    def _open_from_library(self, path: str, hash_: str) -> None:
+        self.open_path(path, known_hash=hash_)
 
-    def _on_library_row_activated(self, _listbox, row, dialog) -> None:
-        dialog.response(Gtk.ResponseType.CLOSE)
-        self.open_path(row.pdf_path, known_hash=row.pdf_hash)
+    def _on_remove_from_library(self, hash_: str) -> None:
+        repo.delete_pdf(hash_)
+        self.library_view.refresh()
 
     def open_path(self, path: str, known_hash: str | None = None) -> None:
-        from pathlib import Path
+        try:
+            hash_, size = pdf_ops.hash_file(Path(path))
+            self.reader_view.load(path)
+        except (FileNotFoundError, OSError, GLib.Error) as e:
+            self._show_error(f"Couldn't open “{path}”.\n\n{e}")
+            return
 
-        hash_, size = pdf_ops.hash_file(Path(path))
-        self.reader_view.load(path)
         title = Path(path).stem
         repo.upsert_pdf(hash_, path, size, path, self.reader_view.page_count, title)
 
@@ -125,3 +125,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.title_label.set_text(f"{title}  ({self.reader_view.page_count} pages)")
         self.chat_panel.set_book(hash_)
         self.chat_panel.restore_anchors_for_current_book()
+        self.stack.set_visible_child_name("reader")
+
+    def _show_error(self, message: str) -> None:
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK, text=message,
+        )
+        dialog.run()
+        dialog.destroy()
