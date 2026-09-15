@@ -132,9 +132,18 @@ class ChatPanel(Gtk.Box):
         self.set_border_width(6)
         self.set_size_request(360, -1)
 
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.anchor_banner = Gtk.Label(label="No text selected", xalign=0)
         self.anchor_banner.set_line_wrap(True)
-        self.pack_start(self.anchor_banner, False, False, 0)
+        top_row.pack_start(self.anchor_banner, True, True, 0)
+        new_anchor_btn = Gtk.Button(label="+ New")
+        new_anchor_btn.set_tooltip_text(
+            "Start a new conversation thread — select new text on the page, "
+            "then ask a question to anchor it here."
+        )
+        new_anchor_btn.connect("clicked", self._on_new_session_clicked)
+        top_row.pack_start(new_anchor_btn, False, False, 0)
+        self.pack_start(top_row, False, False, 0)
 
         self.pack_start(self._build_anchors_list(), False, False, 0)
 
@@ -269,6 +278,18 @@ class ChatPanel(Gtk.Box):
         self.session_id = str(uuid.uuid4())
         repo.create_session(self.session_id, self.pdf_hash)
         self.webview.run_javascript("window.clearMessages && window.clearMessages();")
+
+    def _on_new_session_clicked(self, _btn) -> None:
+        """Explicit 'start fresh' — otherwise a follow-up with no new
+        selection silently inherits the previous anchor (see _on_send),
+        so without this there's no way to deliberately move on to a new
+        piece of text without also picking a new anchor immediately."""
+        if self.pdf_hash is None:
+            return
+        self.new_session()
+        self.status_label.set_text("")
+        self.anchor_banner.set_text("No text selected — select text on the page to anchor a new question.")
+        self.refresh_anchors_list()
 
     def load_session(self, session_id: str) -> None:
         self.session_id = session_id
