@@ -1,0 +1,24 @@
+#!/bin/bash
+# Launches Custom PDF Reader from inside the AppImage.
+#
+# This is a "thin" AppImage: it bundles the app's own Python source and its
+# one non-system dependency (httpx), but runs on the HOST's python3 + GTK3 +
+# WebKit2GTK + Evince (libevdocument3/libevview3) rather than vendoring
+# those in. This app embeds Evince's own rendering engine via GObject
+# Introspection, so those libraries are load-bearing, not incidental —
+# bundling a second copy of WebKit2GTK/GTK3 inside the AppImage is both
+# extremely heavy and notoriously fragile (GL/rendering breakage), so the
+# standard approach for a GTK+PyGObject app built this way is to rely on
+# the system copies, same as running from a checkout. See README.md for
+# the one-time `apt-get install` this still requires.
+set -e
+HERE="$(dirname "$(readlink -f "${0}")")"
+export PYTHONPATH="$HERE/usr/lib/customPdfReader:$HERE/usr/lib/customPdfReader/pydeps:${PYTHONPATH:-}"
+
+PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ]; then
+    echo "Custom PDF Reader requires python3 on the host (with python3-gi, gir1.2-evince-3.0, gir1.2-webkit2-4.1 installed)." >&2
+    exit 1
+fi
+
+exec "$PYTHON" -m app.main "$@"

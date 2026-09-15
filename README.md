@@ -53,6 +53,23 @@ set -a && source .env && set +a
 .venv/bin/python -m app.main [path/to/file.pdf]
 ```
 
+## Packaging (AppImage)
+
+```bash
+./packaging/build-appimage.sh
+./CustomPdfReader-x86_64.AppImage [path/to/file.pdf]
+```
+
+This is a "thin" AppImage: it bundles the app's own source and its one
+non-system Python dependency (`httpx`), but runs on the *host's*
+python3 + GTK3 + WebKit2GTK + Evince rather than vendoring those in — this
+app embeds Evince's own rendering engine, so those libraries are
+load-bearing, not incidental. Fully bundling WebKit2GTK/GTK3 inside an
+AppImage is both very heavy and notoriously fragile (GL/rendering
+breakage), so the machine running the AppImage still needs the packages
+listed under Requirements installed, same as running from a checkout. See
+`packaging/AppRun` for the exact reasoning.
+
 ## Layout
 
 ```
@@ -70,8 +87,11 @@ app/
 
 ## Status
 
-Working vertical slice: open a PDF, render it natively, select text, ask a
-question, get a streamed answer, and the selection is highlighted as a
-clickable anchor that persists across reopens. Not yet built: a library
-picker for URL-loaded PDFs in the UI, message/anchor deletion, and app
-packaging (.deb/AppImage).
+Open a PDF, render it natively, select text, ask a question, get a
+streamed answer, and the selection is highlighted as a clickable anchor
+that persists across reopens and scrolls precisely back to itself. A
+library screen lists every previously opened book; an anchors list groups
+each book's conversations by thread, with click-to-jump and delete on
+both individual messages and whole threads. Packaged as an AppImage. Not
+yet built: a UI for loading a PDF from a URL (the backend support exists
+in `pdf_ops.download_pdf`, just no button for it) and a `.deb`.

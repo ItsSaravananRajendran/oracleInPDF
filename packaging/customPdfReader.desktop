@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Custom PDF Reader
+GenericName=PDF Reader
+Comment=Native PDF reader with anchored AI chat, built on Evince's rendering engine
+Exec=customPdfReader %f
+Icon=customPdfReader
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
