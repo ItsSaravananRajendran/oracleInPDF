@@ -13,7 +13,7 @@ GOOGLE_AI_STUDIO_API_KEY = os.environ.get("GOOGLE_AI_STUDIO_API_KEY")
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY")
 
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
-GOOGLE_MODEL = os.environ.get("GOOGLE_MODEL", "gemini-3.6-flash")
+GOOGLE_MODEL = os.environ.get("GOOGLE_AI_STUDIO_MODEL", "gemini-3.6-flash")
 MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M1")
 
 # How much of the page's extracted text to send around a text anchor, in

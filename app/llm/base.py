@@ -34,9 +34,14 @@ class Provider:
     model: str
     api_key: str
     extra_headers: dict | None = None
-    # Some providers (MiniMax M3) leak <think>...</think> into the content
-    # stream instead of using a separate reasoning_content field.
-    strip_think_tags: bool = False
+
+
+# Reasoning-model tag names some providers leak into the content stream
+# instead of a separate reasoning_content field — e.g. MiniMax M3 uses
+# <think>, some Gemma variants use <thought>. Stripping is always on and
+# is a no-op when a tag never appears, so this list covers any provider/
+# model without per-provider configuration.
+REASONING_TAGS = ("think", "thought")
 
 
 def _user_content(anchor_text: Optional[str], page_text: Optional[str], question: str) -> str:
@@ -53,25 +58,36 @@ def _user_content(anchor_text: Optional[str], page_text: Optional[str], question
     return "\n\n".join(lines)
 
 
-def _think_stripper():
-    """Mirrors minimax_client.py's `_strip`: MiniMax M3 sometimes embeds
-    <think>...</think> in the content stream instead of reasoning_content."""
-    state = {"in_think": False}
+def _reasoning_tag_stripper(tags: tuple[str, ...] = REASONING_TAGS):
+    """Mirrors minimax_client.py's `_strip`, generalized to any of `tags`
+    (e.g. <think>, <thought>) instead of just <think>. Only one tag can be
+    "open" at a time — reasoning blocks don't nest different tag names."""
+    state = {"open_tag": None}
 
     def strip(text: str) -> str:
         out = text
-        if not state["in_think"]:
-            i = out.find("<think>")
-            if i != -1:
-                out = out[:i]
-                state["in_think"] = True
-            return out
-        i = out.find("</think>")
-        if i != -1:
-            out = out[i + len("</think>"):]
-            state["in_think"] = False
-            return strip(out)
-        return ""
+        if state["open_tag"] is None:
+            earliest = None
+            tag_name = None
+            tag_len = 0
+            for t in tags:
+                marker = f"<{t}>"
+                i = out.find(marker)
+                if i != -1 and (earliest is None or i < earliest):
+                    earliest, tag_name, tag_len = i, t, len(marker)
+            if earliest is None:
+                return out
+            before = out[:earliest]
+            state["open_tag"] = tag_name
+            # The close tag (and real content after it) may be in this same
+            # chunk — keep processing instead of dropping the rest.
+            return before + strip(out[earliest + tag_len:])
+        close = f"</{state['open_tag']}>"
+        i = out.find(close)
+        if i == -1:
+            return ""
+        state["open_tag"] = None
+        return strip(out[i + len(close):])
 
     return strip
 
@@ -104,7 +120,7 @@ def stream_chat(
         **(provider.extra_headers or {}),
     }
 
-    strip = _think_stripper() if provider.strip_think_tags else None
+    strip = _reasoning_tag_stripper()
 
     try:
         with httpx.Client(timeout=httpx.Timeout(120.0, read=120.0)) as client:
@@ -134,7 +150,7 @@ def stream_chat(
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                     if content:
-                        cleaned = strip(content) if strip else content
+                        cleaned = strip(content)
                         if cleaned:
                             yield {"type": "token", "text": cleaned}
                 yield {"type": "done"}

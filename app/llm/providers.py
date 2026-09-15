@@ -31,6 +31,5 @@ def active_provider() -> Provider | None:
             endpoint="https://api.minimax.io/v1/chat/completions",
             model=settings.MINIMAX_MODEL,
             api_key=settings.MINIMAX_API_KEY,
-            strip_think_tags=True,
         )
     return None
