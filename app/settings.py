@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("PDF_READER_DATA_DIR", str(Path.home() / ".local/share/custom-pdf-reader")))
+DATA_DIR = Path(os.environ.get("PDF_READER_DATA_DIR") or str(Path.home() / ".local/share/custom-pdf-reader"))
 SQLITE_PATH = DATA_DIR / "app.db"
 PDF_CACHE_DIR = DATA_DIR / "pdfs"
 

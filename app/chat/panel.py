@@ -22,6 +22,7 @@ CHAT_HTML_SHELL = """<!doctype html><html><head><meta charset="utf-8">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
 body { font: 14px/1.5 -apple-system, sans-serif; margin: 0; padding: 8px; background: #fff; color: #1a1a1a; }
 .msg { position: relative; margin-bottom: 14px; padding: 8px 26px 8px 10px; border-radius: 8px; }
@@ -36,10 +37,55 @@ code { font-family: ui-monospace, monospace; }
 </style></head>
 <body><div id="root"></div>
 <script>
+var mdReady = false;
+function initMarkdown() {
+  if (mdReady || !window.marked || !window.katex) return mdReady;
+  marked.use({
+    extensions: [
+      {
+        name: "inlineMath", level: "inline",
+        start: function(src) { return src.indexOf("$"); },
+        tokenizer: function(src) {
+          var match = /^\\$([^$\\n]+?)\\$/.exec(src);
+          if (!match) return undefined;
+          return { type: "inlineMath", raw: match[0], text: match[1] };
+        },
+        renderer: function(token) {
+          try { return katex.renderToString(token.text, { throwOnError: false, displayMode: false }); }
+          catch (e) { return token.text; }
+        },
+      },
+      {
+        name: "blockMath", level: "block",
+        start: function(src) { return src.indexOf("$$"); },
+        tokenizer: function(src) {
+          var match = /^\\$\\$([^$]+?)\\$\\$(?:\\n|$)/.exec(src);
+          if (!match) return undefined;
+          return { type: "blockMath", raw: match[0], text: match[1] };
+        },
+        renderer: function(token) {
+          try { return katex.renderToString(token.text, { throwOnError: false, displayMode: true }); }
+          catch (e) { return "<pre>" + token.text + "</pre>"; }
+        },
+      },
+    ],
+  });
+  mdReady = true;
+  return true;
+}
+var PURIFY_OPTS = {
+  ALLOWED_TAGS: ["p","br","strong","em","b","i","u","s","code","pre","a","ul","ol","li",
+    "blockquote","h1","h2","h3","h4","h5","h6","hr","table","thead","tbody","tr","th","td",
+    "span","div","annotation","semantics","mrow","mi","mo","mn","mfrac","msup","msub","math"],
+  ALLOWED_ATTR: ["href","title","class","style","target","rel","xmlns","encoding"],
+};
 function render() {
   document.querySelectorAll('.md').forEach(function(el) {
     if (el.dataset.rendered) return;
-    if (window.marked) { el.innerHTML = marked.parse(el.textContent); el.dataset.rendered = "1"; }
+    if (!initMarkdown()) return;
+    var raw = marked.parse(el.textContent);
+    el.innerHTML = window.DOMPurify ? DOMPurify.sanitize(raw, PURIFY_OPTS) : raw;
+    el.dataset.rendered = "1";
   });
 }
 window.appendMessage = function(html) {
