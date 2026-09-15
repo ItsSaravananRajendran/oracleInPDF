@@ -70,6 +70,30 @@ breakage), so the machine running the AppImage still needs the packages
 listed under Requirements installed, same as running from a checkout. See
 `packaging/AppRun` for the exact reasoning.
 
+## Desktop integration (launch from the dash/dock)
+
+API keys: the app now loads a `.env` file itself (`app/settings.py`), checked
+at the repo root and at `$XDG_DATA_HOME/custom-pdf-reader/.env` (default
+`~/.local/share/custom-pdf-reader/.env`) — a real exported env var always
+wins over either. This matters for a desktop launch specifically: clicking
+an icon starts with none of a terminal's exported vars, so without this the
+app would silently show "No LLM API key configured" even with a working
+`.env`.
+
+```bash
+mkdir -p ~/.local/bin ~/.local/share/applications \
+    ~/.local/share/icons/hicolor/256x256/apps ~/.local/share/custom-pdf-reader
+cp CustomPdfReader-x86_64.AppImage ~/.local/bin/customPdfReader.AppImage
+cp packaging/customPdfReader.png ~/.local/share/icons/hicolor/256x256/apps/
+cp .env ~/.local/share/custom-pdf-reader/.env   # so a desktop launch finds your API key
+sed "s|Exec=customPdfReader|Exec=$HOME/.local/bin/customPdfReader.AppImage|" \
+    packaging/customPdfReader.desktop > ~/.local/share/applications/customPdfReader.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+The app should then show up in your app launcher/dash as "Custom PDF
+Reader" — pin it from there to keep it in the dock.
+
 ## Layout
 
 ```
