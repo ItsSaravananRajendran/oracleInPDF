@@ -292,10 +292,27 @@ class ChatPanel(Gtk.Box):
         self.refresh_anchors_list()
 
     def load_session(self, session_id: str) -> None:
+        """Replay a session's messages. A follow-up question asked without
+        a new selection inherits the prior anchor for LLM-context/pairing
+        purposes (see _on_send), but every message carrying that same
+        inherited anchor would otherwise re-display the anchor quote box —
+        show it only on the message that actually introduced that anchor
+        (its first occurrence in the session), not on every repeat."""
         self.session_id = session_id
         self.webview.run_javascript("window.clearMessages && window.clearMessages();")
+        seen_anchor_keys: set[tuple] = set()
         for m in repo.list_messages(session_id):
-            self._render_message(m["id"], m["role"], m["text"], m["anchor_text"])
+            anchor_text_to_show = None
+            if m["role"] == "user" and m["anchor_text"]:
+                key = self._anchor_key(
+                    m["anchor_page"],
+                    json.loads(m["anchor_rects"]) if m["anchor_rects"] else None,
+                    m["anchor_text"],
+                )
+                if key not in seen_anchor_keys:
+                    seen_anchor_keys.add(key)
+                    anchor_text_to_show = m["anchor_text"]
+            self._render_message(m["id"], m["role"], m["text"], anchor_text_to_show)
 
     def restore_anchors_for_current_book(self) -> None:
         """Recreate highlight annotations for every anchor ever asked about
@@ -374,7 +391,10 @@ class ChatPanel(Gtk.Box):
             for annot in created_annots:
                 self._annot_to_message[id(annot)] = user_msg_id
             self._annots_by_anchor_key[self._anchor_key(anchor_page, anchor_rects, anchor_text)] = created_annots
-        self._render_message(user_msg_id, "user", question, anchor_text)
+        # Only show the anchor quote box when this message introduced a
+        # genuinely new selection (created_annots non-empty) — an inherited
+        # anchor is stored for LLM-context/pairing but isn't re-displayed.
+        self._render_message(user_msg_id, "user", question, anchor_text if created_annots else None)
 
         assistant_msg_id = str(uuid.uuid4())
         repo.add_message(
