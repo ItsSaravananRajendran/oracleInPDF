@@ -36,7 +36,8 @@ class ReaderView(Gtk.ScrolledWindow):
         self.on_anchor_clicked = None       # callback(annot)
 
         self._annot_index: dict[int, tuple[int, object]] = {}  # id(annot) -> (page_index, annot)
-        self._last_created: tuple[int, dict] | None = None
+        self._recording = False
+        self._created_batch: list[tuple[int, dict, object]] = []
 
         self.view.connect("selection-changed", self._on_selection_changed)
         self.view.connect("annot-added", self._on_annot_added)
@@ -77,15 +78,21 @@ class ReaderView(Gtk.ScrolledWindow):
             self.on_selection_changed(self.selected_text())
 
     def create_anchor_from_selection(self):
-        """Turn the current text selection into a highlight annotation.
-        Returns (page_index, rect, annot) synchronously — 'annot-added'
-        fires within the call — or None if there's no active selection."""
+        """Turn the current text selection into highlight annotation(s).
+        Usually one, but a selection dragged across a page boundary fires
+        'annot-added' once per page — all of them are returned so callers
+        can track/clean up every highlight the selection produced, even
+        though only the first is treated as the anchor's canonical
+        (page, rect) for persistence. Returns a list, empty if there was
+        no active selection."""
         text = self.selected_text()
         if not text:
-            return None
-        self._last_created = None
+            return []
+        self._recording = True
+        self._created_batch = []
         self.view.add_text_markup_annotation_for_selected_text()
-        return self._last_created
+        self._recording = False
+        return self._created_batch
 
     def _on_annot_added(self, _view, annot) -> None:
         page_index = annot.get_page_index()
@@ -93,7 +100,8 @@ class ReaderView(Gtk.ScrolledWindow):
         annot.set_rgba(HIGHLIGHT_RGBA)
         self._annot_index[id(annot)] = (page_index, annot)
         rect = {"x1": area.x1, "y1": area.y1, "x2": area.x2, "y2": area.y2}
-        self._last_created = (page_index, rect, annot)
+        if self._recording:
+            self._created_batch.append((page_index, rect, annot))
         if self.on_anchor_created:
             self.on_anchor_created(page_index, rect, annot)
 
@@ -113,6 +121,13 @@ class ReaderView(Gtk.ScrolledWindow):
         self.document.add_annotation(annot, out_rect)
         self._annot_index[id(annot)] = (page_index, annot)
         return annot
+
+    def remove_annotation(self, annot) -> None:
+        """Remove a highlight annotation (e.g. its anchor was deleted)."""
+        if annot is None:
+            return
+        self.view.remove_annotation(annot)
+        self._annot_index.pop(id(annot), None)
 
     def _on_button_press(self, _widget, event):
         """Hit-test against our own tracked annotations, not EvMappingList

@@ -141,6 +141,11 @@ def update_message_text(
         )
 
 
+def get_message(message_id: str):
+    with conn() as c:
+        return c.execute("SELECT * FROM message WHERE id=?", (message_id,)).fetchone()
+
+
 def list_messages(session_id: str):
     with conn() as c:
         return c.execute(

@@ -24,11 +24,13 @@ CHAT_HTML_SHELL = """<!doctype html><html><head><meta charset="utf-8">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 <style>
 body { font: 14px/1.5 -apple-system, sans-serif; margin: 0; padding: 8px; background: #fff; color: #1a1a1a; }
-.msg { margin-bottom: 14px; padding: 8px 10px; border-radius: 8px; }
+.msg { position: relative; margin-bottom: 14px; padding: 8px 26px 8px 10px; border-radius: 8px; }
 .msg.user { background: #eef2ff; }
 .msg.assistant { background: #f5f5f5; }
 .role { font-size: 11px; color: #888; margin-bottom: 4px; text-transform: uppercase; }
 .anchor { font-size: 12px; color: #666; background: #fff9db; border-left: 3px solid #f0c419; padding: 2px 6px; margin-bottom: 6px; cursor: pointer; }
+.delete { position: absolute; top: 6px; right: 6px; cursor: pointer; color: #aaa; font-size: 13px; line-height: 1; border: none; background: none; padding: 2px 4px; }
+.delete:hover { color: #c0392b; }
 pre { background: #272822; color: #eee; padding: 8px; border-radius: 6px; overflow-x: auto; }
 code { font-family: ui-monospace, monospace; }
 </style></head>
@@ -43,7 +45,7 @@ function render() {
 window.appendMessage = function(html) {
   var d = document.createElement('div');
   d.innerHTML = html;
-  document.getElementById('root').appendChild(d);
+  document.getElementById('root').appendChild(d.firstElementChild);
   render();
   window.scrollTo(0, document.body.scrollHeight);
 };
@@ -53,6 +55,12 @@ window.updateLastAssistant = function(text) {
   if (last) { last.textContent = text; last.dataset.rendered = ""; render(); window.scrollTo(0, document.body.scrollHeight); }
 };
 window.clearMessages = function() { document.getElementById('root').innerHTML = ""; };
+document.getElementById('root').addEventListener('click', function(ev) {
+  var btn = ev.target.closest('.delete');
+  if (btn && window.webkit) {
+    window.webkit.messageHandlers.pyHandler.postMessage(JSON.stringify({type: 'delete', id: btn.dataset.id}));
+  }
+});
 </script>
 </body></html>"""
 
@@ -69,7 +77,8 @@ class ChatPanel(Gtk.Box):
         self.pdf_hash: str | None = None
         self._streaming_msg_id: str | None = None
         self._streaming_text = ""
-        self._annot_to_message: dict[int, str] = {}  # id(annot) -> message_id
+        self._annot_to_message: dict[int, str] = {}    # id(annot) -> message_id
+        self._annots_by_anchor_key: dict[tuple, list] = {}  # (page, rects_json, text) -> [annot, ...]
 
         reader_view.on_anchor_clicked = self._on_anchor_clicked
 
@@ -80,7 +89,10 @@ class ChatPanel(Gtk.Box):
         self.anchor_banner.set_line_wrap(True)
         self.pack_start(self.anchor_banner, False, False, 0)
 
-        self.webview = WebKit2.WebView()
+        content_manager = WebKit2.UserContentManager()
+        content_manager.register_script_message_handler("pyHandler")
+        content_manager.connect("script-message-received::pyHandler", self._on_script_message)
+        self.webview = WebKit2.WebView.new_with_user_content_manager(content_manager)
         self.webview.load_html(CHAT_HTML_SHELL, "file:///")
         scroller = Gtk.ScrolledWindow()
         scroller.add(self.webview)
@@ -127,12 +139,14 @@ class ChatPanel(Gtk.Box):
         self.session_id = session_id
         self.webview.run_javascript("window.clearMessages && window.clearMessages();")
         for m in repo.list_messages(session_id):
-            self._render_message(m["role"], m["text"], m["anchor_text"])
+            self._render_message(m["id"], m["role"], m["text"], m["anchor_text"])
 
     def restore_anchors_for_current_book(self) -> None:
         """Recreate highlight annotations for every anchor ever asked about
         in this book (across all sessions), so they're visible on reopen,
         and remember which message each one opens on click."""
+        self._annot_to_message.clear()
+        self._annots_by_anchor_key.clear()
         for a in repo.list_anchors_for_pdf(self.pdf_hash):
             rects = a["anchor_rects"]
             if not rects:
@@ -140,6 +154,12 @@ class ChatPanel(Gtk.Box):
             annot = self.reader_view.restore_anchor(a["anchor_page"], rects[0], a["anchor_text"] or "")
             if annot is not None:
                 self._annot_to_message[id(annot)] = a["message_id"]
+                self._annots_by_anchor_key[self._anchor_key(a["anchor_page"], rects, a["anchor_text"])] = [annot]
+
+    @staticmethod
+    def _anchor_key(page, rects, text) -> tuple:
+        rects_json = json.dumps(rects) if rects else None
+        return (page, rects_json, text)
 
     def _on_anchor_clicked(self, annot) -> None:
         message_id = self._annot_to_message.get(id(annot))
@@ -174,27 +194,41 @@ class ChatPanel(Gtk.Box):
         anchor_text = self.reader_view.selected_text()
         anchor_page = None
         anchor_rects = None
-        created_annot = None
+        created_annots = []
         if anchor_text:
-            created = self.reader_view.create_anchor_from_selection()
-            if created:
-                anchor_page, rect, created_annot = created
+            batch = self.reader_view.create_anchor_from_selection()
+            if batch:
+                anchor_page, rect, _ = batch[0]
                 anchor_rects = [rect]
+                created_annots = [annot for _, _, annot in batch]
+        else:
+            # Follow-up with no new selection: inherit the session's last anchor.
+            prior = repo.last_message_with_anchor(self.session_id)
+            if prior is not None:
+                anchor_page = prior["anchor_page"]
+                anchor_rects = json.loads(prior["anchor_rects"]) if prior["anchor_rects"] else None
+                anchor_text = prior["anchor_text"]
 
         user_msg_id = str(uuid.uuid4())
         repo.add_message(
             user_msg_id, self.session_id, "user", question,
             anchor_page=anchor_page, anchor_rects=anchor_rects, anchor_text=anchor_text,
         )
-        if created_annot is not None:
-            self._annot_to_message[id(created_annot)] = user_msg_id
-        self._render_message("user", question, anchor_text)
+        if created_annots:
+            for annot in created_annots:
+                self._annot_to_message[id(annot)] = user_msg_id
+            self._annots_by_anchor_key[self._anchor_key(anchor_page, anchor_rects, anchor_text)] = created_annots
+        self._render_message(user_msg_id, "user", question, anchor_text)
 
         assistant_msg_id = str(uuid.uuid4())
-        repo.add_message(assistant_msg_id, self.session_id, "assistant", "", status="streaming")
+        repo.add_message(
+            assistant_msg_id, self.session_id, "assistant", "",
+            anchor_page=anchor_page, anchor_rects=anchor_rects, anchor_text=anchor_text,
+            status="streaming",
+        )
         self._streaming_msg_id = assistant_msg_id
         self._streaming_text = ""
-        self._render_message("assistant", "", None)
+        self._render_message(assistant_msg_id, "assistant", "", None)
         self.status_label.set_text("Thinking…")
 
         page_text = self.reader_view.page_text(anchor_page) if anchor_page is not None else None
@@ -242,12 +276,42 @@ class ChatPanel(Gtk.Box):
         self._streaming_msg_id = None
         return False
 
+    # ---- deletion --------------------------------------------------------
+
+    def _on_script_message(self, _manager, js_result) -> None:
+        try:
+            payload = json.loads(js_result.to_string())
+        except (AttributeError, ValueError):
+            return
+        if payload.get("type") == "delete" and payload.get("id"):
+            self.delete_message(payload["id"])
+
+    def delete_message(self, message_id: str) -> None:
+        row = repo.get_message(message_id)
+        if row is None:
+            return
+        if row["anchor_page"] is not None:
+            key = self._anchor_key(row["anchor_page"], json.loads(row["anchor_rects"]) if row["anchor_rects"] else None, row["anchor_text"])
+            annots = self._annots_by_anchor_key.pop(key, [])
+            for annot in annots:
+                self.reader_view.remove_annotation(annot)
+                self._annot_to_message.pop(id(annot), None)
+            repo.delete_anchor_for_message(message_id)
+        else:
+            repo.delete_message(message_id)
+        self.load_session(self.session_id)
+
     # ---- rendering --------------------------------------------------------
 
-    def _render_message(self, role: str, text: str, anchor_text: str | None) -> None:
+    def _render_message(self, message_id: str, role: str, text: str, anchor_text: str | None) -> None:
         anchor_html = ""
         if anchor_text:
             preview = anchor_text if len(anchor_text) <= 200 else anchor_text[:200] + "…"
             anchor_html = f'<div class="anchor">“{GLib.markup_escape_text(preview)}”</div>'
-        html = f'<div class="msg {role}"><div class="role">{role}</div>{anchor_html}<div class="md">{GLib.markup_escape_text(text)}</div></div>'
+        html = (
+            f'<div class="msg {role}">'
+            f'<button class="delete" data-id="{message_id}" title="Delete">✕</button>'
+            f'<div class="role">{role}</div>{anchor_html}'
+            f'<div class="md">{GLib.markup_escape_text(text)}</div></div>'
+        )
         self.webview.run_javascript(f"window.appendMessage && window.appendMessage({_esc(html)});")
