@@ -12,7 +12,8 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import GLib, Gtk, WebKit2  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import GLib, Gtk, Pango, WebKit2  # noqa: E402
 
 from app.db import repo
 from app.llm import providers
@@ -135,6 +136,8 @@ class ChatPanel(Gtk.Box):
         self.anchor_banner.set_line_wrap(True)
         self.pack_start(self.anchor_banner, False, False, 0)
 
+        self.pack_start(self._build_anchors_list(), False, False, 0)
+
         content_manager = WebKit2.UserContentManager()
         content_manager.register_script_message_handler("pyHandler")
         content_manager.connect("script-message-received::pyHandler", self._on_script_message)
@@ -166,6 +169,87 @@ class ChatPanel(Gtk.Box):
             self.entry.set_sensitive(False)
             send_btn.set_sensitive(False)
 
+    # ---- anchors list (one row per conversation thread) -------------------
+
+    def _build_anchors_list(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        header = Gtk.Label(label="<b>Anchors</b>", use_markup=True, xalign=0)
+        box.pack_start(header, False, False, 0)
+
+        self.anchors_empty = Gtk.Label(
+            label="No anchors yet. Select text and ask a question to create one.",
+            xalign=0,
+        )
+        self.anchors_empty.set_line_wrap(True)
+        self.anchors_empty.get_style_context().add_class("dim-label")
+        box.pack_start(self.anchors_empty, False, False, 0)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(0)
+        scroller.set_max_content_height(160)
+        scroller.set_propagate_natural_height(True)
+        self.anchors_listbox = Gtk.ListBox()
+        self.anchors_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.anchors_listbox.connect("row-activated", self._on_anchor_row_activated)
+        scroller.add(self.anchors_listbox)
+        box.pack_start(scroller, False, False, 0)
+        return box
+
+    def refresh_anchors_list(self) -> None:
+        for child in self.anchors_listbox.get_children():
+            self.anchors_listbox.remove(child)
+
+        anchors = repo.list_anchors_for_pdf(self.pdf_hash) if self.pdf_hash else []
+        threads: dict[str, dict] = {}
+        order: list[str] = []
+        for a in anchors:
+            sid = a["session_id"]
+            if sid not in threads:
+                threads[sid] = {"title_msg": a, "count": 1}
+                order.append(sid)
+            else:
+                g = threads[sid]
+                g["count"] += 1
+                if a["role"] == "user" and a["created_at"] < g["title_msg"]["created_at"]:
+                    g["title_msg"] = a
+
+        self.anchors_empty.set_visible(len(order) == 0)
+
+        for sid in order:
+            g = threads[sid]
+            title_msg = g["title_msg"]
+            row = Gtk.ListBoxRow()
+            row.session_id = sid
+            row.anchor_page = title_msg["anchor_page"]
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hbox.set_border_width(4)
+
+            page_badge = Gtk.Label(label=f"p.{title_msg['anchor_page'] + 1}")
+            page_badge.get_style_context().add_class("dim-label")
+            hbox.pack_start(page_badge, False, False, 0)
+
+            text = title_msg["text"] or "(no text)"
+            preview = text if len(text) <= 60 else text[:60] + "…"
+            text_label = Gtk.Label(label=preview, xalign=0)
+            text_label.set_ellipsize(Pango.EllipsizeMode.END)
+            hbox.pack_start(text_label, True, True, 0)
+
+            followups = g["count"] - 1
+            if followups > 0:
+                badge = Gtk.Label(label=f"+{followups}")
+                badge.get_style_context().add_class("dim-label")
+                hbox.pack_start(badge, False, False, 0)
+
+            row.add(hbox)
+            self.anchors_listbox.add(row)
+        self.anchors_listbox.show_all()
+
+    def _on_anchor_row_activated(self, _listbox, row) -> None:
+        self.reader_view.go_to_page(row.anchor_page)
+        if row.session_id != self.session_id:
+            self.load_session(row.session_id)
+
     # ---- wiring from the reader ---------------------------------------
 
     def set_book(self, pdf_hash: str) -> None:
@@ -175,6 +259,7 @@ class ChatPanel(Gtk.Box):
             self.load_session(existing["id"])
         else:
             self.new_session()
+        self.refresh_anchors_list()
 
     def new_session(self) -> None:
         self.session_id = str(uuid.uuid4())
@@ -276,6 +361,7 @@ class ChatPanel(Gtk.Box):
         self._streaming_text = ""
         self._render_message(assistant_msg_id, "assistant", "", None)
         self.status_label.set_text("Thinking…")
+        self.refresh_anchors_list()
 
         page_text = self.reader_view.page_text(anchor_page) if anchor_page is not None else None
         history = [
@@ -346,6 +432,7 @@ class ChatPanel(Gtk.Box):
         else:
             repo.delete_message(message_id)
         self.load_session(self.session_id)
+        self.refresh_anchors_list()
 
     # ---- rendering --------------------------------------------------------
 
