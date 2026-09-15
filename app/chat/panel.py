@@ -222,6 +222,7 @@ class ChatPanel(Gtk.Box):
             row = Gtk.ListBoxRow()
             row.session_id = sid
             row.anchor_page = title_msg["anchor_page"]
+            row.anchor_rects = title_msg["anchor_rects"]
             hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             hbox.set_border_width(4)
 
@@ -246,7 +247,10 @@ class ChatPanel(Gtk.Box):
         self.anchors_listbox.show_all()
 
     def _on_anchor_row_activated(self, _listbox, row) -> None:
-        self.reader_view.go_to_page(row.anchor_page)
+        if row.anchor_rects:
+            self.reader_view.go_to_anchor(row.anchor_page, row.anchor_rects[0])
+        else:
+            self.reader_view.go_to_page(row.anchor_page)
         if row.session_id != self.session_id:
             self.load_session(row.session_id)
 

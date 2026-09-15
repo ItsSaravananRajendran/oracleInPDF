@@ -13,7 +13,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("EvinceDocument", "3.0")
 gi.require_version("EvinceView", "3.0")
-from gi.repository import EvinceDocument, EvinceView, Gdk, Gio, Gtk  # noqa: E402
+from gi.repository import EvinceDocument, EvinceView, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 EvinceDocument.init()
 
@@ -66,6 +66,36 @@ class ReaderView(Gtk.ScrolledWindow):
 
     def go_to_page(self, page_index: int) -> None:
         self.model.set_page(page_index)
+
+    def go_to_anchor(self, page_index: int, rect: dict) -> None:
+        """Scroll to the exact anchor position on a page, not just the
+        page's top. get_page_extents() returns the page's rect in
+        absolute document-scroll coordinates (its y matches the vertical
+        adjustment's value directly, unaffected by further scrolling), so
+        the target adjustment value is that rect's top plus the anchor's
+        offset into the page — no viewport-relative math needed.
+
+        set_page() triggers its own async scroll-to-page-top that lands
+        *after* an idle callback fires and overwrites a same-idle-cycle
+        adjustment change — confirmed by tracing vadjustment across
+        frames. So the fine-scroll is applied twice, at 60ms and 250ms:
+        the first catches most cases, the second is a safety net for a
+        slower layout pass on a large document."""
+        self.model.set_page(page_index)
+
+        def _fine_scroll():
+            page_area = Gdk.Rectangle()
+            found = self.view.get_page_extents(page_index, page_area, Gtk.Border())
+            if found:
+                scale = self.model.get_scale()
+                vadj = self.get_vadjustment()
+                target = page_area.y + rect["y1"] * scale - 24  # small top margin
+                upper = max(vadj.get_lower(), vadj.get_upper() - vadj.get_page_size())
+                vadj.set_value(min(max(target, vadj.get_lower()), upper))
+            return False
+
+        GLib.timeout_add(60, _fine_scroll)
+        GLib.timeout_add(250, _fine_scroll)
 
     # ---- selection / anchors -----------------------------------------
 
@@ -133,21 +163,30 @@ class ReaderView(Gtk.ScrolledWindow):
         """Hit-test against our own tracked annotations, not EvMappingList
         (its `.data` comes back as a raw gpointer int through GI — not
         usable as a Python object — so identity has to come from the
-        Annotation instances we already hold from creation/restore)."""
+        Annotation instances we already hold from creation/restore).
+
+        get_page_extents() returns page rects in absolute document-scroll
+        coordinates, but GdkEventButton.x/y are viewport-relative — they
+        only coincide when the vertical adjustment is 0 (page 0, unscrolled).
+        Convert the event into the same absolute space before comparing."""
         if event.button != 1 or self.document is None:
             return False
         current = self.model.get_page()
         scale = self.model.get_scale()
+        vadj = self.get_vadjustment()
+        hadj = self.get_hadjustment()
+        abs_x = event.x + (hadj.get_value() if hadj else 0)
+        abs_y = event.y + (vadj.get_value() if vadj else 0)
         for page_index in range(max(0, current - 2), min(self.page_count, current + 3)):
             rect = Gdk.Rectangle()
             found = self.view.get_page_extents(page_index, rect, Gtk.Border())
             if not found:
                 continue
-            if not (rect.x <= event.x <= rect.x + rect.width
-                    and rect.y <= event.y <= rect.y + rect.height):
+            if not (rect.x <= abs_x <= rect.x + rect.width
+                    and rect.y <= abs_y <= rect.y + rect.height):
                 continue
-            doc_x = (event.x - rect.x) / scale
-            doc_y = (event.y - rect.y) / scale
+            doc_x = (abs_x - rect.x) / scale
+            doc_y = (abs_y - rect.y) / scale
             for annot_page, annot in self._annot_index.values():
                 if annot_page != page_index:
                     continue
