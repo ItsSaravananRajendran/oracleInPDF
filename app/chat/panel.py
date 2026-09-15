@@ -251,9 +251,50 @@ class ChatPanel(Gtk.Box):
                 badge.get_style_context().add_class("dim-label")
                 hbox.pack_start(badge, False, False, 0)
 
+            delete_btn = Gtk.Button(label="✕")
+            delete_btn.set_relief(Gtk.ReliefStyle.NONE)
+            delete_btn.set_tooltip_text("Delete this conversation thread")
+            # A child Gtk.Button consumes its own button-press-event, so
+            # this doesn't also trigger the row's "row-activated" handler.
+            delete_btn.connect("clicked", self._on_delete_thread_clicked, sid)
+            hbox.pack_start(delete_btn, False, False, 0)
+
             row.add(hbox)
             self.anchors_listbox.add(row)
         self.anchors_listbox.show_all()
+
+    def _on_delete_thread_clicked(self, _btn, session_id: str) -> None:
+        dialog = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), modal=True, message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Delete this conversation thread and all its messages?",
+            secondary_text="This cannot be undone.",
+        )
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Delete", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self.delete_thread(session_id)
+
+    def delete_thread(self, session_id: str) -> None:
+        """Delete a whole conversation thread (every message in the
+        session) and every highlight annotation any of its anchors created."""
+        for m in repo.list_messages(session_id):
+            if m["anchor_page"] is None:
+                continue
+            key = self._anchor_key(
+                m["anchor_page"],
+                json.loads(m["anchor_rects"]) if m["anchor_rects"] else None,
+                m["anchor_text"],
+            )
+            annots = self._annots_by_anchor_key.pop(key, [])
+            for annot in annots:
+                self.reader_view.remove_annotation(annot)
+                self._annot_to_message.pop(id(annot), None)
+        repo.delete_session(session_id)
+        if session_id == self.session_id:
+            self.new_session()
+        self.refresh_anchors_list()
 
     def _on_anchor_row_activated(self, _listbox, row) -> None:
         if row.anchor_rects:
