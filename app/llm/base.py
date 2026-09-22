@@ -44,6 +44,8 @@ class Provider:
 # model without per-provider configuration.
 REASONING_TAGS = ("think", "thought")
 
+TRUNCATION_NOTICE = "\n\n*(Response cut off at the length limit — ask it to continue, or narrow the question.)*"
+
 
 def _user_content(anchor_text: Optional[str], page_text: Optional[str], question: str) -> str:
     lines = []
@@ -140,7 +142,16 @@ def stream_chat(
 
     body = {
         "model": provider.model,
-        "max_tokens": 2048,
+        # Reasoning-capable models (Gemini 3.6, MiniMax) spend hidden
+        # "thinking" tokens out of this same budget before any visible
+        # content — 2048 was observed (live) to be fully consumed by
+        # thinking alone on a demanding question, producing zero visible
+        # output despite streaming normally otherwise. 8192 leaves real
+        # headroom for both; still finite, so an intentionally unbounded
+        # ask ("explain literally everything") can still hit the cap —
+        # handled below by surfacing finish_reason == "length" instead of
+        # just silently ending.
+        "max_tokens": 8192,
         "temperature": 0.3,
         "stream": True,
         "messages": messages,
@@ -167,6 +178,7 @@ def stream_chat(
                     yield {"type": "error", "message": f"HTTP {r.status_code}: {msg}"}
                     return
 
+                truncated = False
                 for line in r.iter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -175,6 +187,8 @@ def stream_chat(
                         leftover = stripper.flush()
                         if leftover:
                             yield {"type": "token", "text": leftover}
+                        if truncated:
+                            yield {"type": "token", "text": TRUNCATION_NOTICE}
                         yield {"type": "done"}
                         return
                     try:
@@ -182,6 +196,8 @@ def stream_chat(
                     except json.JSONDecodeError:
                         continue
                     choice = (obj.get("choices") or [{}])[0]
+                    if choice.get("finish_reason") == "length":
+                        truncated = True
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                     if content:
@@ -191,6 +207,8 @@ def stream_chat(
                 leftover = stripper.flush()
                 if leftover:
                     yield {"type": "token", "text": leftover}
+                if truncated:
+                    yield {"type": "token", "text": TRUNCATION_NOTICE}
                 yield {"type": "done"}
     except httpx.HTTPError as e:
         yield {"type": "error", "message": str(e)}
