@@ -59,38 +59,69 @@ def _user_content(anchor_text: Optional[str], page_text: Optional[str], question
     return "\n\n".join(lines)
 
 
-def _reasoning_tag_stripper(tags: tuple[str, ...] = REASONING_TAGS):
-    """Mirrors minimax_client.py's `_strip`, generalized to any of `tags`
-    (e.g. <think>, <thought>) instead of just <think>. Only one tag can be
-    "open" at a time — reasoning blocks don't nest different tag names."""
-    state = {"open_tag": None}
+class ReasoningTagStripper:
+    """Strips <think>/<thought>-style reasoning blocks from a streamed
+    response. Generalizes minimax_client.py's original `_strip` to any of
+    `tags` and — the important difference — buffers suppressed text
+    instead of discarding it as it's seen.
 
-    def strip(text: str) -> str:
-        out = text
-        if state["open_tag"] is None:
-            earliest = None
-            tag_name = None
-            tag_len = 0
-            for t in tags:
-                marker = f"<{t}>"
-                i = out.find(marker)
-                if i != -1 and (earliest is None or i < earliest):
-                    earliest, tag_name, tag_len = i, t, len(marker)
-            if earliest is None:
-                return out
-            before = out[:earliest]
-            state["open_tag"] = tag_name
-            # The close tag (and real content after it) may be in this same
-            # chunk — keep processing instead of dropping the rest.
-            return before + strip(out[earliest + tag_len:])
-        close = f"</{state['open_tag']}>"
-        i = out.find(close)
-        if i == -1:
-            return ""
-        state["open_tag"] = None
-        return strip(out[i + len(close):])
+    Why buffering matters: MiniMax has been observed (live, via this app)
+    to open a <think> tag and then never close it for the rest of the
+    stream — the actual final answer ends up inside the "still open" tag
+    with no closing marker ever arriving. A discard-on-sight stripper
+    loses that answer permanently and silently. Buffering lets flush()
+    release it instead when the stream ends without a close tag."""
 
-    return strip
+    def __init__(self, tags: tuple[str, ...] = REASONING_TAGS):
+        self.tags = tags
+        self.open_tag: str | None = None
+        self.buffer = ""
+
+    def feed(self, text: str) -> str:
+        out = ""
+        remaining = text
+        while remaining:
+            if self.open_tag is None:
+                earliest = None
+                tag_name = None
+                tag_len = 0
+                for t in self.tags:
+                    marker = f"<{t}>"
+                    i = remaining.find(marker)
+                    if i != -1 and (earliest is None or i < earliest):
+                        earliest, tag_name, tag_len = i, t, len(marker)
+                if earliest is None:
+                    out += remaining
+                    remaining = ""
+                else:
+                    out += remaining[:earliest]
+                    self.open_tag = tag_name
+                    self.buffer = ""
+                    remaining = remaining[earliest + tag_len:]
+            else:
+                close = f"</{self.open_tag}>"
+                i = remaining.find(close)
+                if i == -1:
+                    self.buffer += remaining
+                    remaining = ""
+                else:
+                    # Everything up to the close tag is real reasoning —
+                    # discarded on purpose, the tag closed as expected.
+                    self.open_tag = None
+                    self.buffer = ""
+                    remaining = remaining[i + len(close):]
+        return out
+
+    def flush(self) -> str:
+        """Call once the stream has ended. Releases buffered content only
+        if a tag was left open — i.e. the close tag never arrived — so
+        the response doesn't just vanish."""
+        if self.open_tag is not None:
+            leftover = self.buffer
+            self.open_tag = None
+            self.buffer = ""
+            return leftover
+        return ""
 
 
 def stream_chat(
@@ -121,7 +152,7 @@ def stream_chat(
         **(provider.extra_headers or {}),
     }
 
-    strip = _reasoning_tag_stripper()
+    stripper = ReasoningTagStripper()
 
     try:
         with httpx.Client(timeout=httpx.Timeout(120.0, read=120.0)) as client:
@@ -141,6 +172,9 @@ def stream_chat(
                         continue
                     payload = line[len("data:"):].strip()
                     if payload == "[DONE]":
+                        leftover = stripper.flush()
+                        if leftover:
+                            yield {"type": "token", "text": leftover}
                         yield {"type": "done"}
                         return
                     try:
@@ -151,9 +185,12 @@ def stream_chat(
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                     if content:
-                        cleaned = strip(content)
+                        cleaned = stripper.feed(content)
                         if cleaned:
                             yield {"type": "token", "text": cleaned}
+                leftover = stripper.flush()
+                if leftover:
+                    yield {"type": "token", "text": leftover}
                 yield {"type": "done"}
     except httpx.HTTPError as e:
         yield {"type": "error", "message": str(e)}
