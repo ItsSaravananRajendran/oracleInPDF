@@ -17,6 +17,7 @@ def active_provider() -> Provider | None:
                 "HTTP-Referer": "https://github.com/ItsSaravananRajendran/customPdfReader",
                 "X-Title": "Custom PDF Reader",
             },
+            max_tokens=settings.OPENROUTER_MAX_TOKENS,
         )
     if settings.GOOGLE_AI_STUDIO_API_KEY:
         return Provider(
@@ -24,6 +25,7 @@ def active_provider() -> Provider | None:
             endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
             model=settings.GOOGLE_MODEL,
             api_key=settings.GOOGLE_AI_STUDIO_API_KEY,
+            max_tokens=settings.GOOGLE_MAX_TOKENS,
         )
     if settings.MINIMAX_API_KEY:
         return Provider(
@@ -31,5 +33,6 @@ def active_provider() -> Provider | None:
             endpoint="https://api.minimax.io/v1/chat/completions",
             model=settings.MINIMAX_MODEL,
             api_key=settings.MINIMAX_API_KEY,
+            max_tokens=settings.MINIMAX_MAX_TOKENS,
         )
     return None

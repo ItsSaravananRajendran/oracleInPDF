@@ -43,6 +43,15 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-5
 GOOGLE_MODEL = os.environ.get("GOOGLE_AI_STUDIO_MODEL", "gemini-3.6-flash")
 MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M1")
 
+# Per-provider response token budgets — reasoning-capable models spend
+# hidden "thinking" tokens out of this same budget before any visible
+# content, and how much they need varies a lot by provider (see
+# llm/base.py's stream_chat). MiniMax's M1 needs a much bigger one than
+# the rest to reliably leave room for a visible answer after thinking.
+OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "8192"))
+GOOGLE_MAX_TOKENS = int(os.environ.get("GOOGLE_AI_STUDIO_MAX_TOKENS", "8192"))
+MINIMAX_MAX_TOKENS = int(os.environ.get("MINIMAX_MAX_TOKENS", "52000"))
+
 # How much of the page's extracted text to send around a text anchor, in
 # characters, when the anchor is short (see llm/context.py).
 MAX_PAGE_TEXT_CHARS = int(os.environ.get("PDF_READER_MAX_PAGE_TEXT_CHARS", "12000"))

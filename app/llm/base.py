@@ -28,6 +28,9 @@ Rules:
 """
 
 
+DEFAULT_MAX_TOKENS = 8192
+
+
 @dataclass(frozen=True)
 class Provider:
     name: str
@@ -35,6 +38,12 @@ class Provider:
     model: str
     api_key: str
     extra_headers: dict | None = None
+    # Reasoning-capable models spend hidden "thinking" tokens out of this
+    # same budget before any visible content (see stream_chat) — how much
+    # of that a model needs varies a lot by provider, so this is
+    # per-provider rather than one constant. MiniMax's M1 in particular
+    # needs a much larger budget (see llm/providers.py) than the default.
+    max_tokens: int = DEFAULT_MAX_TOKENS
 
 
 # Reasoning-model tag names some providers leak into the content stream
@@ -142,16 +151,17 @@ def stream_chat(
 
     body = {
         "model": provider.model,
-        # Reasoning-capable models (Gemini 3.6, MiniMax) spend hidden
-        # "thinking" tokens out of this same budget before any visible
-        # content — 2048 was observed (live) to be fully consumed by
-        # thinking alone on a demanding question, producing zero visible
-        # output despite streaming normally otherwise. 8192 leaves real
-        # headroom for both; still finite, so an intentionally unbounded
-        # ask ("explain literally everything") can still hit the cap —
+        # Reasoning-capable models spend hidden "thinking" tokens out of
+        # this same budget before any visible content — 2048 was observed
+        # (live) to be fully consumed by thinking alone on a demanding
+        # question, producing zero visible output despite streaming
+        # normally otherwise. provider.max_tokens leaves real headroom for
+        # both, sized per-provider since how much thinking a model needs
+        # varies a lot; still finite, so an intentionally unbounded ask
+        # ("explain literally everything") can still hit the cap —
         # handled below by surfacing finish_reason == "length" instead of
         # just silently ending.
-        "max_tokens": 8192,
+        "max_tokens": provider.max_tokens,
         "temperature": 0.3,
         "stream": True,
         "messages": messages,
