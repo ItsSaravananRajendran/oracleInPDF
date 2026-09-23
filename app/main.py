@@ -13,7 +13,10 @@ from app.window import MainWindow
 
 class PdfReaderApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="dev.customPdfReader", flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        super().__init__(
+            application_id="dev.customPdfReader",
+            flags=Gio.ApplicationFlags.HANDLES_OPEN | Gio.ApplicationFlags.NON_UNIQUE,
+        )
         self.window = None
         self._open_path = None
 
