@@ -14,6 +14,12 @@ from contextlib import contextmanager
 from app import settings
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS folder (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    created_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pdf (
     hash        TEXT PRIMARY KEY,
     source      TEXT NOT NULL,   -- original file path or URL
@@ -21,7 +27,9 @@ CREATE TABLE IF NOT EXISTS pdf (
     page_count  INTEGER,
     title       TEXT,
     path        TEXT NOT NULL,   -- cached local path
-    created_at  INTEGER NOT NULL
+    folder_id   INTEGER,         -- NULL = unfiled (shown in the "Unfiled" pseudo-folder)
+    created_at  INTEGER NOT NULL,
+    FOREIGN KEY (folder_id) REFERENCES folder(id) ON DELETE SET DEFAULT
 );
 
 CREATE TABLE IF NOT EXISTS pdf_text_cache (
@@ -68,7 +76,25 @@ def init_db() -> None:
     settings.PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(settings.SQLITE_PATH) as connection:
         connection.executescript(SCHEMA)
+        _migrate(connection)
         connection.commit()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Apply schema migrations that `CREATE TABLE IF NOT EXISTS` alone
+    can't express. Currently:
+      - pre-folder DBs: `pdf.folder_id` column is missing. SQLite can't
+        add a foreign-key column to an existing table, but we don't need
+        the FK at the column level — the `folder` table itself enforces
+        referential integrity via `ON DELETE SET DEFAULT`, and the app
+        layer's `delete_folder` already moves books back to NULL before
+        dropping the row.
+    Adding the column with NULL default means every existing PDF is
+    auto-classified as "Unfiled" — the user can then drag them into
+    folders as they wish."""
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(pdf)")}
+    if "folder_id" not in cols:
+        connection.execute("ALTER TABLE pdf ADD COLUMN folder_id INTEGER")
 
 
 @contextmanager

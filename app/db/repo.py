@@ -37,6 +37,16 @@ def upsert_pdf(
         )
 
 
+def set_pdf_folder(pdf_hash: str, folder_id: Optional[int]) -> None:
+    """Assign a PDF to a folder (None = unfiled). Passing a folder_id that
+    no longer exists is treated as a no-op — the caller should validate
+    first, or we could raise; in practice the only path that does this is
+    the UI's folder dropdown, which is built from `list_folders()` and so
+    can't pick a deleted one."""
+    with conn() as c:
+        c.execute("UPDATE pdf SET folder_id=? WHERE hash=?", (folder_id, pdf_hash))
+
+
 def get_pdf(hash_: str):
     with conn() as c:
         return c.execute("SELECT * FROM pdf WHERE hash=?", (hash_,)).fetchone()
@@ -216,20 +226,105 @@ def delete_anchor_for_message(message_id: str) -> int:
 
 # ---- Library -------------------------------------------------------
 
-def list_pdfs():
+def list_pdfs(folder_id: Optional[int] = None, include_unfiled: bool = False):
+    """List PDFs in the library.
+
+    `folder_id=None, include_unfiled=False`  → all PDFs (legacy behavior).
+    `folder_id=<int>`                        → just that folder's books.
+    `folder_id=None, include_unfiled=True`   → only unfiled books
+                                               (folder_id IS NULL), for the
+                                               "Unfiled" pseudo-folder row.
+    """
+    where = []
+    params: list = []
+    if folder_id is not None and not include_unfiled:
+        where.append("p.folder_id = ?")
+        params.append(folder_id)
+    elif folder_id is None and include_unfiled:
+        where.append("p.folder_id IS NULL")
+    sql = """SELECT p.hash, p.source, p.path, p.title, p.page_count, p.bytes,
+                    p.created_at, p.folder_id,
+                    (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash) AS last_session_at,
+                    (SELECT COUNT(*) FROM session s WHERE s.pdf_hash=p.hash) AS session_count,
+                    (SELECT COUNT(*) FROM message m JOIN session s ON m.session_id=s.id
+                     WHERE s.pdf_hash=p.hash) AS message_count
+             FROM pdf p"""
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += """ ORDER BY COALESCE(
+                (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash),
+                p.created_at
+              ) DESC"""
+    with conn() as c:
+        return c.execute(sql, params).fetchall()
+
+
+# ---- Folder --------------------------------------------------------
+
+def create_folder(name: str) -> int:
+    """Create a folder and return its new id. Empty / whitespace-only names
+    are rejected by the UI before reaching here, but we still trim and
+    collapse blanks defensively so a stray "   " from a dialog round-trip
+    doesn't pollute the library."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("folder name cannot be empty")
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO folder(name, created_at) VALUES(?, ?)",
+            (name, int(time.time())),
+        )
+        return cur.lastrowid
+
+
+def list_folders():
+    """All folders in the order they were created, with the count of PDFs
+    in each. Used to populate the top-level library grid; the count next
+    to each folder name comes from this."""
     with conn() as c:
         return c.execute(
-            """SELECT p.hash, p.source, p.path, p.title, p.page_count, p.bytes, p.created_at,
-                      (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash) AS last_session_at,
-                      (SELECT COUNT(*) FROM session s WHERE s.pdf_hash=p.hash) AS session_count,
-                      (SELECT COUNT(*) FROM message m JOIN session s ON m.session_id=s.id
-                       WHERE s.pdf_hash=p.hash) AS message_count
-               FROM pdf p
-               ORDER BY COALESCE(
-                 (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash),
-                 p.created_at
-               ) DESC"""
+            """SELECT f.id, f.name, f.created_at,
+                      (SELECT COUNT(*) FROM pdf p WHERE p.folder_id=f.id) AS book_count
+               FROM folder f
+               ORDER BY f.created_at ASC, f.id ASC"""
         ).fetchall()
+
+
+def rename_folder(folder_id: int, new_name: str) -> None:
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("folder name cannot be empty")
+    with conn() as c:
+        c.execute("UPDATE folder SET name=? WHERE id=?", (new_name, folder_id))
+
+
+def delete_folder(folder_id: int) -> None:
+    """Drop a folder and move every PDF it contained back to "Unfiled".
+    Done in one transaction so a crash mid-delete can't leave books
+    orphaned against a non-existent folder. The schema's `ON DELETE SET
+    DEFAULT` would otherwise null `folder_id` for them, which is the same
+    end state — we still prefer the explicit UPDATE so the intent is
+    documented in the code, not just the schema."""
+    with conn() as c:
+        c.execute("UPDATE pdf SET folder_id=NULL WHERE folder_id=?", (folder_id,))
+        c.execute("DELETE FROM folder WHERE id=?", (folder_id,))
+
+
+def get_folder(folder_id: int):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM folder WHERE id=?", (folder_id,)
+        ).fetchone()
+
+
+def count_unfiled_pdfs() -> int:
+    """Cheap single-int lookup used by the "Unfiled" pseudo-folder row in
+    the library view. Separate from list_pdfs() so we don't pay the
+    full-row fetch just to render a count badge."""
+    with conn() as c:
+        return c.execute(
+            "SELECT COUNT(*) AS n FROM pdf WHERE folder_id IS NULL"
+        ).fetchone()["n"]
 
 
 def list_anchors_for_pdf(pdf_hash):

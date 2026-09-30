@@ -1,6 +1,10 @@
 """Shared sync SSE streaming against an OpenAI-compatible /chat/completions
-endpoint. Text-only: the anchor is sent as extracted PDF text, never as an
-image crop, per the desktop app's design (unlike the webapp original).
+endpoint. Text-only in the common path: the anchor is sent as extracted
+PDF text. Image-region anchors (Ctrl+drag a rectangle on a page; see
+reader/view.py) instead attach a PNG crop as a multimodal `image_url`
+content part alongside the page's extracted text — all three configured
+providers (OpenRouter, Google AI Studio, MiniMax) accept the
+OpenAI-compatible image_url format natively.
 
 Ported + collapsed from anchored-pdf-reader's openrouter_client.py /
 google_client.py / minimax_client.py, which were ~95% identical. Runs
@@ -16,13 +20,15 @@ from typing import Callable, Iterator, Optional
 
 import httpx
 
-SYSTEM_PROMPT = """You are a careful, knowledgeable reading assistant embedded in a PDF reader, helping the user understand what they're reading. The user has selected a specific span of text on one page (the "anchor") and asked a question about it.
+SYSTEM_PROMPT = """You are a careful, knowledgeable reading assistant embedded in a PDF reader, helping the user understand what they're reading. The user has anchored their question to one specific page: either by selecting a span of text on it ("text anchor") or by Ctrl+drag-capturing a rectangular image region of it ("image anchor"). They've asked a question about that anchor.
 
 Rules:
-- Ground your answer in the anchor text and the surrounding page text — that's what the user is looking at, so start there and quote it when it clarifies the answer.
-- The provided text is what the user selected, not the limit of what you're allowed to know. When the page states a result without spelling out the reasoning (e.g. a derivation, a proof, a worked example, background on a term it assumes the reader already knows), work it out or explain it yourself using your own knowledge, consistent with the notation and definitions already established earlier in the page/book when possible. This is the main way you're useful — don't refuse just because the derivation itself isn't printed on the page.
+- Ground your answer in the anchor and the surrounding page text — that's what the user is looking at, so start there and quote it when it clarifies the answer.
+- For image anchors: a screenshot of the region is attached to the message. Treat that image as the primary ground truth for what's being asked about, with the surrounding page text as supplementary context (the page text covers the full page, so it tells you what surrounds the region and may repeat content from inside it).
+- For text anchors: the selected span is the primary ground truth; the page text is supplementary context.
+- The provided text and image are what the user is looking at, not the limit of what you're allowed to know. When the page states a result without spelling out the reasoning (e.g. a derivation, a proof, a worked example, background on a term it assumes the reader already knows), work it out or explain it yourself using your own knowledge, consistent with the notation and definitions already established earlier in the page/book when possible. This is the main way you're useful — don't refuse just because the derivation itself isn't printed on the page.
 - Be clear about what's your own explanation versus what the page itself says, when the distinction matters — e.g. "the page doesn't spell this out, but here's the derivation:" rather than implying the book states something it doesn't.
-- Don't invent claims about what the text says. If you're not sure what the anchor is even about, say so — but that's different from refusing to explain a concept the text merely doesn't elaborate on.
+- Don't invent claims about what the text or image contains. If you're not sure what the anchor is even about, say so — but that's different from refusing to explain a concept the text merely doesn't elaborate on.
 - The user is anchored to one specific page; do not pretend to know about other pages of this specific document unless context is provided.
 - Use plain prose. Avoid bullet lists unless they genuinely help. No headings unless the answer is long. Use LaTeX ($...$ / $$...$$) for math.
 """
@@ -56,7 +62,24 @@ REASONING_TAGS = ("think", "thought")
 TRUNCATION_NOTICE = "\n\n*(Response cut off at the length limit — ask it to continue, or narrow the question.)*"
 
 
-def _user_content(anchor_text: Optional[str], page_text: Optional[str], question: str) -> str:
+def _user_content(anchor_text: Optional[str], page_text: Optional[str],
+                  question: str, image_data_url: Optional[str] = None):
+    """Build the user-role message content. Returns either a plain
+    string (text-only path, what every text anchor call uses) or a
+    list of content parts (text + image_url) for image-anchor calls.
+
+    The conditional shape is intentional: most calls go through the
+    text-only path, and OpenAI-style providers are happy to receive a
+    string in a content field. The multimodal path uses a list so
+    multiple content parts can be combined. `_serialize_content`
+    flattens whichever shape we have into the JSON the wire format
+    expects.
+
+    `image_data_url` is expected to be a fully-formed `data:` URL
+    (e.g. `data:image/png;base64,iVBOR...`) — this function does not
+    encode bytes for you, so the caller (ChatPanel) handles base64
+    encoding with its own logging/error surface.
+    """
     lines = []
     if anchor_text:
         lines.append("SELECTED TEXT (the anchor the user is asking about):\n" + anchor_text.strip())
@@ -67,7 +90,18 @@ def _user_content(anchor_text: Optional[str], page_text: Optional[str], question
     else:
         lines.append("SURROUNDING PAGE TEXT: (this page has no extractable text layer)")
     lines.append("USER QUESTION:\n" + question)
-    return "\n\n".join(lines)
+    text = "\n\n".join(lines)
+    if image_data_url is None:
+        return text
+    # Multimodal: keep the text part first so models that prefer early
+    # text (most do) see the question first, with the image as supporting
+    # evidence. The image_url type follows the OpenAI-compatible spec,
+    # which all three configured providers (OpenRouter, Google AI Studio,
+    # MiniMax) accept natively.
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": image_data_url}},
+    ]
 
 
 class ReasoningTagStripper:
@@ -141,13 +175,22 @@ def stream_chat(
     anchor_text: Optional[str],
     page_text: Optional[str],
     history: list[dict],
+    image_data_url: Optional[str] = None,
 ) -> Iterator[dict]:
     """Yields {"type": "token"|"error"|"done", ...} dicts. Blocking — call
-    from a worker thread, not the GTK main thread."""
+    from a worker thread, not the GTK main thread.
+
+    `image_data_url`, if supplied, is attached as a multimodal content
+    part to the user message — used by the Ctrl+drag image-region
+    feature (see reader/view.py). Must be a fully-formed `data:` URL;
+    the caller is responsible for base64-encoding the PNG bytes."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in history[-16:]:
         messages.append({"role": turn["role"], "content": turn["content"]})
-    messages.append({"role": "user", "content": _user_content(anchor_text, page_text, question)})
+    messages.append({
+        "role": "user",
+        "content": _user_content(anchor_text, page_text, question, image_data_url),
+    })
 
     body = {
         "model": provider.model,

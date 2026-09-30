@@ -22,6 +22,11 @@ this does.
 - Drag-select text on a page and ask a question about it. The full selected
   text (not an image crop) plus the rest of the page's extracted text is
   sent to the LLM.
+- Ctrl+drag a rectangular region on a page to ask about something visual
+  (a figure, a table, a formula). The captured PNG plus the page's
+  extracted text is sent to the LLM; the region shows up as a faint
+  rectangle on the page that you can click to jump back to the chat.
+  Plain drag (no Ctrl) still selects text — same as before.
 - The selection becomes a real highlight annotation, rendered by Evince's
   own engine. Click any highlight to jump back to the chat that produced it.
 - Streaming chat via OpenRouter, Google AI Studio (Gemini), or MiniMax —
@@ -29,6 +34,17 @@ this does.
 - Library of previously opened PDFs (SQLite), with sessions and full
   message history per book.
 - Markdown + KaTeX rendering in assistant replies.
+- Dark mode (toggle in the toolbar; opt-in via `PDF_READER_DARK_MODE=1`).
+  The PDF page is rendered with inverted colors so light-on-dark text is
+  readable without straining, and the toggle carries across documents
+  (opening a new PDF in dark mode keeps the page inverted).
+- Page-number jump box + current/total label wired to the Evince
+  view's page-changed signal — type a page number or use the arrows.
+- Find text in the loaded PDF (toolbar button or just start typing in
+  the search bar). Search runs on a worker thread, supports
+  case-sensitive mode, and highlights every match on the page it's
+  landed on; Enter / Shift+Enter step through matches across the whole
+  document.
 
 ## Requirements
 
@@ -119,3 +135,16 @@ each book's conversations by thread, with click-to-jump and delete on
 both individual messages and whole threads. Packaged as an AppImage. Not
 yet built: a UI for loading a PDF from a URL (the backend support exists
 in `pdf_ops.download_pdf`, just no button for it) and a `.deb`.
+
+## Image-region anchors (Ctrl+drag)
+
+In addition to plain text selection, hold **Ctrl** and drag a rectangle
+on the page to capture an image region. The captured PNG (rendered
+through Evince's own backend at 144 DPI, independent of the on-screen
+zoom) is attached to the user message alongside the page's extracted
+text, so the LLM sees both the visual content and the surrounding
+context. The region is rendered on the page as a faint blue rectangle —
+not a real Evince highlight, since Evince's annotation model only
+supports text marks — and clicking it jumps back to the conversation
+that produced it. Plain drag (no Ctrl) still selects text exactly as
+before.

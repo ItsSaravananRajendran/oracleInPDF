@@ -56,6 +56,11 @@ MINIMAX_MAX_TOKENS = int(os.environ.get("MINIMAX_MAX_TOKENS", "52000"))
 # characters, when the anchor is short (see llm/context.py).
 MAX_PAGE_TEXT_CHARS = int(os.environ.get("PDF_READER_MAX_PAGE_TEXT_CHARS", "12000"))
 
+# UI preferences.
+DARK_MODE_DEFAULT = os.environ.get("PDF_READER_DARK_MODE", "").lower() in ("1", "true", "yes", "on")
+# Read once at startup; mutated at runtime by the toolbar's dark-mode toggle.
+DARK_MODE = DARK_MODE_DEFAULT
+
 
 def active_provider() -> str | None:
     if OPENROUTER_API_KEY:
