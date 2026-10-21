@@ -124,6 +124,13 @@ class LibraryView(Gtk.Box):
         self.header_box.pack_start(self.header_actions_box, False, False, 0)
         self.pack_start(self.header_box, False, False, 0)
 
+        # Search box: while non-empty it replaces the folder/folder-detail
+        # list with a flat list of matching books from every folder.
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search books…")
+        self.search_entry.connect("search-changed", lambda _e: self.refresh())
+        self.pack_start(self.search_entry, False, False, 0)
+
         # Empty-state label, shared across modes (text is set per mode).
         self.empty_label = Gtk.Label(xalign=0.5)
         self.empty_label.set_margin_top(40)
@@ -154,7 +161,9 @@ class LibraryView(Gtk.Box):
             self.listbox.remove(child)
         self._rebuild_header()
 
-        if self._current is None:
+        if self.search_entry.get_text().strip():
+            self._populate_search_results(self.search_entry.get_text().strip())
+        elif self._current is None:
             self._populate_folder_list()
         else:
             self._populate_pdf_list(self._current[0])
@@ -299,6 +308,19 @@ class LibraryView(Gtk.Box):
             hbox.pack_start(open_btn, True, True, 0)
             row.add(hbox)
             self.listbox.add(row)
+
+    # ---- search mode ------------------------------------------------
+
+    def _populate_search_results(self, query: str) -> None:
+        terms = query.lower().split()
+        pdfs = [
+            p for p in repo.list_pdfs()
+            if all(t in f"{p['title'] or ''} {p['source'] or ''}".lower() for t in terms)
+        ]
+        self.empty_label.set_visible(len(pdfs) == 0)
+        self.empty_label.set_text(f"No books match “{query}”.")
+        for p in pdfs:
+            self._add_pdf_row(p)
 
     # ---- folder-detail mode -----------------------------------------
 

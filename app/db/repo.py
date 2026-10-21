@@ -234,6 +234,9 @@ def list_pdfs(folder_id: Optional[int] = None, include_unfiled: bool = False):
     `folder_id=None, include_unfiled=True`   → only unfiled books
                                                (folder_id IS NULL), for the
                                                "Unfiled" pseudo-folder row.
+
+    Every mode is returned alphabetically by the name shown on the row
+    (see the ORDER BY below for what that name resolves to).
     """
     where = []
     params: list = []
@@ -251,10 +254,16 @@ def list_pdfs(folder_id: Optional[int] = None, include_unfiled: bool = False):
              FROM pdf p"""
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += """ ORDER BY COALESCE(
-                (SELECT MAX(s.created_at) FROM session s WHERE s.pdf_hash=p.hash),
-                p.created_at
-              ) DESC"""
+    # Alphabetical by the same string the row label shows: the PDF's
+    # title when it has one, otherwise the source path/URL. NULLIF handles
+    # an empty-string title, which the label's `p['title'] or p['source']`
+    # also treats as absent — without it those rows would sort together at
+    # the top instead of among their real names. NOCASE so "apple" and
+    # "Apple" land next to each other rather than splitting the list, and
+    # `p.hash` as the tiebreaker so two books with the same name keep a
+    # stable order across refreshes instead of reshuffling each time.
+    sql += """ ORDER BY COALESCE(NULLIF(TRIM(p.title), ''), p.source) COLLATE NOCASE ASC,
+                      p.hash ASC"""
     with conn() as c:
         return c.execute(sql, params).fetchall()
 

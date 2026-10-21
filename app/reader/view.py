@@ -78,6 +78,15 @@ class ReaderView(Gtk.ScrolledWindow):
 
         self.document = None
         self.path = None
+        # A SECOND, independent EvDocument used only for Ctrl+drag region
+        # capture. Never render regions through `self.document` — that
+        # instance is owned and actively rendered by the live EvView, and
+        # poppler's EvDocument is not re-entrant. Calling `.render()` on it
+        # from outside EvView's own render cycle segfaults the whole
+        # process (see capture_page_region). A private instance has no
+        # view attached, so rendering is safe and cannot disturb what is
+        # on screen. Built in load(); None whenever no file is open.
+        self._capture_doc = None
 
         self.on_selection_changed = None   # callback(text: str)
         self.on_anchor_created = None       # callback(page_index: int, rect: dict)
@@ -163,6 +172,15 @@ class ReaderView(Gtk.ScrolledWindow):
         document = EvinceDocument.Document.factory_get_document(uri)
         self.document = document
         self.path = path
+        # Drop the previous capture document first so we never hold two
+        # poppler handles on the old file open at once.
+        self._capture_doc = None
+        try:
+            self._capture_doc = EvinceDocument.Document.factory_get_document(uri)
+        except Exception:
+            # Capture falls back to building one on demand; a failure here
+            # must not stop the document from opening for reading.
+            self._capture_doc = None
         self._annot_index.clear()
         self._clear_search_hits()
         # Region overlays are not part of the Evince document — they live
@@ -310,6 +328,8 @@ class ReaderView(Gtk.ScrolledWindow):
             return
         self.view.remove_annotation(annot)
         self._annot_index.pop(id(annot), None)
+        # Evince doesn't always repaint the page after removal.
+        self.view.queue_draw()
 
     # ---- search ------------------------------------------------------
 
@@ -739,13 +759,33 @@ class ReaderView(Gtk.ScrolledWindow):
 
         Renders at REGION_CAPTURE_SCALE (2.0 = 144 DPI) — enough
         resolution for vision LLMs to read small text without bloating
-        memory for accidental full-page captures."""
+        memory for accidental full-page captures.
+
+        CRITICAL: this renders through `self._capture_doc`, a private
+        EvDocument, NEVER `self.document`. The latter is owned by the live
+        EvView and re-entering its render path segfaults poppler — that
+        is exactly what made Ctrl+drag appear to "work on some pages
+        only" (it survived only when the page happened to be idle/cached
+        at that instant, and crashed the app on the rest)."""
         if self.document is None:
             return None
-        if page_index < 0 or page_index >= self.document.get_n_pages():
+        doc = self._capture_doc
+        if doc is None:
+            # Capture document went missing (e.g. load() was interrupted).
+            # Build one on demand rather than silently losing the feature.
+            if not self.path:
+                return None
+            try:
+                doc = EvinceDocument.Document.factory_get_document(
+                    Gio.File.new_for_path(self.path).get_uri()
+                )
+                self._capture_doc = doc
+            except Exception:
+                return None
+        if page_index < 0 or page_index >= doc.get_n_pages():
             return None
         try:
-            page = self.document.get_page(page_index)
+            page = doc.get_page(page_index)
             # Evince's `Document.render` takes a single EvRenderContext,
             # not (page, rotation, scale) directly — the context bundles
             # those three. Rotation is in 90° units (0/90/180/270); we
@@ -753,7 +793,7 @@ class ReaderView(Gtk.ScrolledWindow):
             # uncommon in the typical reading flow, and the rect is
             # stored in the un-rotated coordinate system anyway.
             rc = EvinceDocument.RenderContext.new(page, 0, REGION_CAPTURE_SCALE)
-            surface = self.document.render(rc)
+            surface = doc.render(rc)
             pixbuf = Gdk.pixbuf_get_from_surface(
                 surface, 0, 0, surface.get_width(), surface.get_height()
             )

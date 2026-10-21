@@ -14,11 +14,12 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 gi.require_version("Pango", "1.0")
-from gi.repository import GLib, Gtk, Pango, WebKit2  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango, WebKit2  # noqa: E402
 
+from app import settings
 from app.db import repo
 from app.llm import providers
-from app.llm.base import stream_chat
+from app.llm.base import stream_chat_with_retry
 
 # Marker stored in `message.anchor_text` to flag an image-region
 # (Ctrl+drag) anchor vs a plain text anchor. The schema has no
@@ -43,7 +44,7 @@ CHAT_HTML_SHELL = """<!doctype html><html><head><meta charset="utf-8">
    the mode was one setting stay consistent if the user flips later —
    live DOM nodes just re-style in place via the cascade. */
 body { font: 14px/1.5 -apple-system, sans-serif; margin: 0; padding: 8px; background: #ffffff; color: #1a1a1a; }
-body.dark { background: #1e1e1e; color: #e6e6e6; }
+body.dark { background: #000; color: #e6e6e6; }
 .msg { position: relative; margin-bottom: 14px; padding: 8px 26px 8px 10px; border-radius: 8px; }
 .msg.user { background: #eef2ff; }
 body.dark .msg.user { background: #2a3550; }
@@ -93,7 +94,7 @@ function initMarkdown() {
         name: "blockMath", level: "block",
         start: function(src) { return src.indexOf("$$"); },
         tokenizer: function(src) {
-          var match = /^\\$\\$([^$]+?)\\$\\$(?:\\n|$)/.exec(src);
+          var match = /^\\$\\$([\\s\\S]+?)\\$\\$(?:\\n|$)/.exec(src);
           if (!match) return undefined;
           return { type: "blockMath", raw: match[0], text: match[1] };
         },
@@ -107,11 +108,12 @@ function initMarkdown() {
   mdReady = true;
   return true;
 }
+// KaTeX emits HTML spans, MathML, and inline <svg> (stretchy glyphs such as
+// \\underbrace, \\widetilde, \\sqrt). A hand-written tag list silently
+// dropped those, so use DOMPurify's built-in html/svg/mathMl profiles.
 var PURIFY_OPTS = {
-  ALLOWED_TAGS: ["p","br","strong","em","b","i","u","s","code","pre","a","ul","ol","li",
-    "blockquote","h1","h2","h3","h4","h5","h6","hr","table","thead","tbody","tr","th","td",
-    "span","div","annotation","semantics","mrow","mi","mo","mn","mfrac","msup","msub","math"],
-  ALLOWED_ATTR: ["href","title","class","style","target","rel","xmlns","encoding"],
+  USE_PROFILES: { html: true, svg: true, mathMl: true },
+  ADD_ATTR: ["encoding"],
 };
 function render() {
   document.querySelectorAll('.md').forEach(function(el) {
@@ -152,6 +154,14 @@ window.updateLastAssistant = function(text) {
   if (last) { last.textContent = text; last.dataset.rendered = ""; render(); window.scrollTo(0, document.body.scrollHeight); }
 };
 window.clearMessages = function() { document.getElementById('root').innerHTML = ""; };
+// Removes a single rendered bubble by its message id. Used to retire the
+// transient error bubble: a failed turn is never written to the DB, so the
+// next send drops that bubble rather than leaving a ghost reply on screen
+// that a reload would silently erase.
+window.removeMessage = function(id) {
+  var el = document.querySelector('.msg[data-id="' + id + '"]');
+  if (el) el.remove();
+};
 document.getElementById('root').addEventListener('click', function(ev) {
   var btn = ev.target.closest('.delete');
   if (btn && window.webkit) {
@@ -171,6 +181,16 @@ def _esc(s: str) -> str:
     return json.dumps(s or "")
 
 
+def _brief(message: str, limit: int = 140) -> str:
+    """One-line, length-capped form of a provider error, for the status
+    label. Provider error bodies are frequently raw JSON blobs several
+    hundred characters long, and the status label is an unwrapped
+    Gtk.Label — the full text would stretch the sidebar to fit the
+    error. The chat bubble still shows the untruncated text."""
+    flat = " ".join((message or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
 class ChatPanel(Gtk.Box):
     def __init__(self, reader_view, initial_dark_mode: bool = False):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -179,6 +199,11 @@ class ChatPanel(Gtk.Box):
         self.pdf_hash: str | None = None
         self._streaming_msg_id: str | None = None
         self._streaming_text = ""
+        # Message id of the most recent failed turn, whose bubble is on
+        # screen but deliberately absent from the DB (see
+        # `_on_stream_error`). Tracked so the next send can retire it —
+        # without this it would linger as a reply that a reload erases.
+        self._error_msg_id: str | None = None
         # `initial_dark_mode` is captured here so the HTML can be loaded
         # with the right body class from the very first paint — no flash
         # of light-mode styles. Set this BEFORE the chat panel is
@@ -255,6 +280,9 @@ class ChatPanel(Gtk.Box):
         self.pack_start(composer, False, False, 0)
 
         self.status_label = Gtk.Label(label="", xalign=0)
+        # Error/retry strings can be long even after `_brief`; wrapping
+        # keeps a single line of status from stretching the sidebar.
+        self.status_label.set_line_wrap(True)
         self.pack_start(self.status_label, False, False, 0)
 
         provider = providers.active_provider()
@@ -422,6 +450,9 @@ class ChatPanel(Gtk.Box):
         call any time — `window.setDarkMode` may not exist yet if the
         page hasn't finished loading, in which case the call is a no-op
         and the `load-changed` listener will replay the state."""
+        bg = Gdk.RGBA()
+        bg.parse("#000000" if self._dark_mode else "#ffffff")
+        self.webview.set_background_color(bg)
         self.webview.run_javascript(
             f"window.setDarkMode && window.setDarkMode({str(bool(self._dark_mode)).lower()});"
         )
@@ -454,6 +485,7 @@ class ChatPanel(Gtk.Box):
         # attach a PNG the user already mentally moved on from.
         self._pending_region = None
         self.webview.run_javascript("window.clearMessages && window.clearMessages();")
+        self._error_msg_id = None
 
     def _on_new_session_clicked(self, _btn) -> None:
         """Explicit 'start fresh' — otherwise a follow-up with no new
@@ -476,6 +508,7 @@ class ChatPanel(Gtk.Box):
         (its first occurrence in the session), not on every repeat."""
         self.session_id = session_id
         self.webview.run_javascript("window.clearMessages && window.clearMessages();")
+        self._error_msg_id = None
         seen_anchor_keys: set[tuple] = set()
         for m in repo.list_messages(session_id):
             anchor_text_to_show = None
@@ -591,6 +624,15 @@ class ChatPanel(Gtk.Box):
             return
         self.entry.set_text("")
 
+        # Retire the previous failure's bubble before appending the new
+        # question: it was never written to the DB, so leaving it up would
+        # show a reply that this send's own `history` doesn't contain.
+        if self._error_msg_id is not None:
+            self.webview.run_javascript(
+                f"window.removeMessage && window.removeMessage({_esc(self._error_msg_id)});"
+            )
+            self._error_msg_id = None
+
         anchor_text = None
         anchor_page = None
         anchor_rects = None
@@ -697,11 +739,24 @@ class ChatPanel(Gtk.Box):
 
     def _stream_worker(self, provider, question, anchor_text, page_text, history, assistant_msg_id, image_data_url=None):
         full_text = []
-        for event in stream_chat(provider, question, anchor_text, page_text, history, image_data_url):
+        for event in stream_chat_with_retry(
+            provider, question, anchor_text, page_text, history, image_data_url,
+            max_attempts=settings.LLM_MAX_ATTEMPTS,
+            base_delay=settings.LLM_RETRY_BASE_DELAY,
+            max_delay=settings.LLM_RETRY_MAX_DELAY,
+        ):
             if event["type"] == "token":
                 full_text.append(event["text"])
                 text_so_far = "".join(full_text)
                 GLib.idle_add(self._on_token, assistant_msg_id, text_so_far)
+            elif event["type"] == "retry":
+                # A retry restarts the turn from scratch, so throw away what
+                # the failed attempt streamed. `_on_token` replaces the whole
+                # bubble on every update, so without this the second attempt
+                # would be concatenated onto the first attempt's leftover
+                # text.
+                full_text = []
+                GLib.idle_add(self._on_retry, assistant_msg_id, event)
             elif event["type"] == "error":
                 GLib.idle_add(self._on_stream_error, assistant_msg_id, event["message"])
             elif event["type"] == "done":
@@ -714,14 +769,52 @@ class ChatPanel(Gtk.Box):
         self.webview.run_javascript(f"window.updateLastAssistant && window.updateLastAssistant({_esc(text_so_far)});")
         return False
 
+    def _on_retry(self, msg_id, event) -> bool:
+        """Report a transient failure and the backoff we're about to sit
+        out, then blank the bubble so the re-attempt starts visibly fresh
+        rather than appearing to continue the failed text."""
+        if msg_id != self._streaming_msg_id:
+            return False
+        self._streaming_text = ""
+        self.status_label.set_text(
+            f"{_brief(event['message'])} — retrying "
+            f"(attempt {event['attempt'] + 1}/{event['max_attempts']}) "
+            f"in {event['delay']:.0f}s…"
+        )
+        self.webview.run_javascript("window.updateLastAssistant && window.updateLastAssistant('');")
+        return False
+
     def _on_stream_error(self, msg_id, message) -> bool:
-        repo.update_message_text(msg_id, message, status="error", error_kind="provider")
-        self.status_label.set_text(f"Error: {message}")
+        """Unrecoverable failure: the retries are used up, or the error
+        was never retryable to begin with (a 400/401, say).
+
+        The message row is deleted rather than updated with the error
+        text. Persisting it would be actively harmful, not just untidy:
+        `_on_send` builds the next request's history from every message in
+        the session, so a stored error would be replayed to the provider
+        as if the assistant had said it — the model would then apologize
+        for, or try to answer, a request that never actually ran. The
+        error stays visible here in the panel (and in the status label
+        until the next send), just not in the conversation."""
+        repo.delete_message(msg_id)
+        # A newer send may have taken over the UI while this one was
+        # backing off; the row is still cleaned up above, but leave the
+        # status label and bubble to the stream that's actually current.
+        if msg_id != self._streaming_msg_id:
+            return False
+        self._streaming_msg_id = None
+        self._error_msg_id = msg_id
+        self.status_label.set_text(f"Error: {_brief(message)}")
         self.webview.run_javascript(f"window.updateLastAssistant && window.updateLastAssistant({_esc('[error] ' + message)});")
         return False
 
     def _on_stream_done(self, msg_id, full_text) -> bool:
         repo.update_message_text(msg_id, full_text, status="complete")
+        # Store the answer even if a newer send has taken over the panel —
+        # the reply did arrive, so it belongs in the conversation. Only
+        # the UI/status reset is the current stream's to make.
+        if msg_id != self._streaming_msg_id:
+            return False
         self.status_label.set_text("")
         self._streaming_msg_id = None
         return False
@@ -766,7 +859,21 @@ class ChatPanel(Gtk.Box):
                 repo.delete_anchor_for_message(message_id)
             else:
                 key = self._anchor_key(row["anchor_page"], json.loads(row["anchor_rects"]) if row["anchor_rects"] else None, row["anchor_text"])
-                annots = self._annots_by_anchor_key.pop(key, [])
+                annots = list(self._annots_by_anchor_key.pop(key, []))
+                # Key lookup can miss (e.g. float/format drift between the
+                # in-memory rect and the stored JSON), which left the
+                # highlight on the page until restart. Also sweep any
+                # annotation mapped to a message sharing this anchor.
+                same_anchor_ids = {
+                    m["id"] for m in repo.list_messages(row["session_id"])
+                    if m["anchor_page"] == row["anchor_page"]
+                    and m["anchor_text"] == row["anchor_text"]
+                }
+                same_anchor_ids.add(message_id)
+                for k in list(self._annots_by_anchor_key):
+                    if any(self._annot_to_message.get(id(a)) in same_anchor_ids
+                           for a in self._annots_by_anchor_key[k]):
+                        annots.extend(self._annots_by_anchor_key.pop(k))
                 for annot in annots:
                     self.reader_view.remove_annotation(annot)
                     self._annot_to_message.pop(id(annot), None)
@@ -814,7 +921,7 @@ class ChatPanel(Gtk.Box):
                 f'</div>'
             )
         html = (
-            f'<div class="msg {role}">'
+            f'<div class="msg {role}" data-id="{message_id}">'
             f'<button class="delete" data-id="{message_id}" title="Delete">✕</button>'
             f'<div class="role">{role}</div>{image_html}{anchor_html}'
             f'<div class="md">{GLib.markup_escape_text(text)}</div></div>'

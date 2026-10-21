@@ -19,6 +19,35 @@ from app.reader.view import ReaderView
 ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 
+# Pure-black override applied only in dark mode: Adwaita-Dark's greys and
+# Evince's page frame/shadow otherwise show up as a light border around
+# the PDF and between panes.
+_DARK_CSS = b"""
+window, .background, stack, paned, scrolledwindow, viewport, .view,
+.content-view, .document-page, EvView, list, row, box, grid { background-color: #000000; background-image: none; }
+list row { border-bottom: 1px solid #222222; }
+list row:hover { background-color: #111111; }
+entry, searchentry { background-color: #111111; background-image: none; color: #e6e6e6; }
+label { color: #e6e6e6; }
+eventbox, frame, expander, toolbar, headerbar, actionbar, notebook, revealer { background-color: #000000; background-image: none; }
+frame > border { border: none; }
+button, combobox button, togglebutton, spinbutton, spinbutton button {
+  background-color: #1a1a1a; background-image: none; color: #e6e6e6;
+  border: 1px solid #333333; box-shadow: none; text-shadow: none; }
+button:hover, togglebutton:hover { background-color: #2a2a2a; background-image: none; }
+button:active, button:checked { background-color: #333333; background-image: none; }
+button.flat { background-color: transparent; border-color: transparent; }
+button.flat:hover { background-color: #2a2a2a; }
+button label, button image { color: #e6e6e6; }
+.dim-label { color: #9a9a9a; }
+menu, menuitem, popover, popover.background { background-color: #111111; background-image: none; color: #e6e6e6; }
+scrollbar, scrollbar trough { background-color: #000000; background-image: none; }
+scrollbar slider { background-color: #444444; }
+scrolledwindow, .document-page { border: none; box-shadow: none; }
+paned > separator { background-color: #000000; background-image: none; min-width: 1px; min-height: 1px; }
+"""
+
+
 def _has_dark_variant(theme_name: str) -> bool:
     """Return True if `<theme_name>-Dark` is installed under any of the
     standard theme search paths. Used by `_set_dark_mode` to fall back
@@ -394,6 +423,15 @@ class MainWindow(Gtk.ApplicationWindow):
         gtk_settings.set_property(
             "gtk-theme-name", f"{base}-Dark" if enabled else base,
         )
+        if not hasattr(self, "_dark_provider"):
+            self._dark_provider = Gtk.CssProvider()
+            self._dark_provider.load_from_data(_DARK_CSS)
+        screen = Gdk.Screen.get_default()
+        if enabled:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, self._dark_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        else:
+            Gtk.StyleContext.remove_provider_for_screen(screen, self._dark_provider)
         self.dark_btn.set_label("☀ Light" if enabled else "🌙 Dark")
         self._pdf_inverted = enabled
         # Only push the inversion to the renderer if a document is loaded —

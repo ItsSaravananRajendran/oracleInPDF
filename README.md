@@ -34,7 +34,7 @@ this does.
 - Library of previously opened PDFs (SQLite), with sessions and full
   message history per book.
 - Markdown + KaTeX rendering in assistant replies.
-- Dark mode (toggle in the toolbar; opt-in via `PDF_READER_DARK_MODE=1`).
+- Dark mode (toggle in the toolbar; on by default; set `PDF_READER_DARK_MODE=0` to start in light mode).
   The PDF page is rendered with inverted colors so light-on-dark text is
   readable without straining, and the toggle carries across documents
   (opening a new PDF in dark mode keeps the page inverted).

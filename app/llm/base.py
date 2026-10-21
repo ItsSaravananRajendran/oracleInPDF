@@ -15,6 +15,7 @@ loop needed in a desktop app.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
@@ -60,6 +61,18 @@ class Provider:
 REASONING_TAGS = ("think", "thought")
 
 TRUNCATION_NOTICE = "\n\n*(Response cut off at the length limit — ask it to continue, or narrow the question.)*"
+
+# HTTP statuses where the *identical* request can plausibly succeed a
+# moment later, so it's worth sending again: overload (529), rate
+# limiting (429), request/gateway timeouts (408/504), and the bare 5xx
+# family that includes the 503 "high demand, try again later" these
+# providers emit under load.
+#
+# Deliberately excluded: 400/401/403/404/422. Those mean the request or
+# the credentials are wrong, so a retry re-sends a request that is
+# guaranteed to be rejected the same way — it only delays the real error
+# from reaching the user (and on a 429, retrying makes the limit worse).
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 
 
 def _user_content(anchor_text: Optional[str], page_text: Optional[str],
@@ -180,6 +193,14 @@ def stream_chat(
     """Yields {"type": "token"|"error"|"done", ...} dicts. Blocking — call
     from a worker thread, not the GTK main thread.
 
+    Error events carry two extra fields beyond `message`, so a caller can
+    decide whether re-sending the request could plausibly help:
+    `status` (the HTTP code, or None when no response arrived) and
+    `retryable` (True only for transient conditions — see
+    RETRYABLE_STATUS). `stream_chat_with_retry` below is the wrapper that
+    acts on them; this function stays single-shot so it can also be used
+    directly where retry isn't wanted.
+
     `image_data_url`, if supplied, is attached as a multimodal content
     part to the user message — used by the Ctrl+drag image-region
     feature (see reader/view.py). Must be a fully-formed `data:` URL;
@@ -228,7 +249,12 @@ def stream_chat(
                         msg = err.get("error", {}).get("message") or err.get("message") or err_body.decode("utf-8", "replace")
                     except Exception:
                         msg = err_body.decode("utf-8", "replace")
-                    yield {"type": "error", "message": f"HTTP {r.status_code}: {msg}"}
+                    yield {
+                        "type": "error",
+                        "message": f"HTTP {r.status_code}: {msg}",
+                        "status": r.status_code,
+                        "retryable": r.status_code in RETRYABLE_STATUS,
+                    }
                     return
 
                 truncated = False
@@ -264,4 +290,82 @@ def stream_chat(
                     yield {"type": "token", "text": TRUNCATION_NOTICE}
                 yield {"type": "done"}
     except httpx.HTTPError as e:
-        yield {"type": "error", "message": str(e)}
+        # No HTTP response at all — DNS, connect, TLS, or a read timeout.
+        # Nothing about the request itself is implicated (we never even got
+        # to a verdict on it), so this is always worth another attempt.
+        yield {"type": "error", "message": str(e), "status": None, "retryable": True}
+
+
+def stream_chat_with_retry(
+    provider: Provider,
+    question: str,
+    anchor_text: Optional[str],
+    page_text: Optional[str],
+    history: list[dict],
+    image_data_url: Optional[str] = None,
+    max_attempts: int = 3,
+    base_delay: float = 1.5,
+    max_delay: float = 20.0,
+) -> Iterator[dict]:
+    """`stream_chat` with exponential backoff over transient failures.
+
+    Emits the same event shapes as `stream_chat`, plus:
+      - {"type": "retry", "attempt", "max_attempts", "delay", "message"}
+        yielded *before* each backoff sleep, so a UI can tell the user
+        what's happening instead of the request just appearing to hang.
+        `attempt` is the attempt that just failed, so the next one is
+        `attempt + 1`.
+
+    Only failures flagged `retryable` by `stream_chat` are retried (see
+    RETRYABLE_STATUS) — a 400/401 comes straight back to the caller, as
+    does a non-retryable error on the final attempt. That final error's
+    message gets the attempt count appended, so the user isn't left
+    guessing whether anything was retried at their request.
+
+    A retry restarts the whole turn rather than resuming mid-stream, so
+    the caller must discard any tokens it has accumulated for the failed
+    attempt — the "retry" event is the signal to do that. (See
+    `_stream_worker` in chat/panel.py, which relies on the assistant
+    bubble being replaced wholesale on each token update.)
+
+    `max_attempts` counts total attempts, so 1 disables retrying. Delays
+    are `base_delay * 2**(attempt-1)`, capped at `max_delay`.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        failure = None
+        gen = stream_chat(provider, question, anchor_text, page_text, history, image_data_url)
+        try:
+            for event in gen:
+                if event["type"] == "error":
+                    failure = event
+                    break
+                yield event
+        finally:
+            # `stream_chat` is itself a generator; breaking out of the loop
+            # above leaves it suspended mid-body, holding an open httpx
+            # connection. Close it deterministically instead of waiting
+            # for the GC.
+            gen.close()
+
+        if failure is None:
+            return
+        if not failure.get("retryable") or attempt >= max_attempts:
+            if attempt > 1:
+                failure = dict(
+                    failure,
+                    message=f"{failure['message']} (gave up after {attempt} attempts)",
+                )
+            yield failure
+            return
+
+        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+        yield {
+            "type": "retry",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "delay": delay,
+            "message": failure["message"],
+        }
+        time.sleep(delay)
